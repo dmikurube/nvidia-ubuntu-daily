@@ -685,6 +685,24 @@ check_firmware() {
   fi
 }
 
+# 通常の描画先とは別に、NVIDIA を明示した GLX の描画経路を確認する。
+check_prime_opengl() {
+  local g rc vendor renderer
+  g=$(timeout 20 env __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia glxinfo -B 2>&1); rc=$?
+  note '$ __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia glxinfo -B' "$g"
+  (( rc != 0 )) && note "[exit $rc]"
+  note ""
+  vendor=$(sed -n 's/^OpenGL vendor string: //p' <<<"$g")
+  renderer=$(sed -n 's/^OpenGL renderer string: //p' <<<"$g")
+  if (( rc == 0 )) && [[ $vendor == *NVIDIA* && -n $renderer ]]; then
+    finding OK "OpenGL (PRIME オフロード): NVIDIA で描画 ($renderer)"
+  else
+    finding WARN "OpenGL (PRIME オフロード): NVIDIA での描画を確認できない" "終了コード: $rc / vendor: ${vendor:-不明} / renderer: ${renderer:-不明}
+通常の描画が正常でも、NVIDIA を明示した GLX の描画経路は確認できていない。画面へのアクセス権や PRIME の設定も確認する。
+→ 上のドライバ関連の所見を確認し、デスクトップのターミナルで __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia glxinfo -B を実行する。詳細は生データを参照"
+  fi
+}
+
 check_userspace() {
   local f v
   sec "ユーザー空間ライブラリ"
@@ -695,8 +713,8 @@ check_userspace() {
   [[ -n $NV_GPUS && ( -n $DRV_PKG || -n $USER_VER ) ]] || return 0
 
   if (( ${#LIB_VERS[@]} > 1 )); then
-    finding WARN "版の違う NVIDIA ライブラリが混在 (${!LIB_VERS[*]})" "パッケージの部分的な更新か、.run インストーラの残骸の可能性。
-→ dpkg -S <ファイル> で持ち主を確認。どのパッケージにも属さないファイルは .run 版の残骸"
+    finding INFO "NVIDIA 関連ライブラリで複数の版を検出 (${!LIB_VERS[*]})" "連携ライブラリにはドライバ本体と独立した版があり、この一覧だけではバージョン不一致を意味しない。
+→ 不調がある場合は、生データの主要ライブラリのリンク先とモジュールの版、描画テストの結果を照合する"
   fi
   local glpkg="libnvidia-gl-${DRV_BRANCH:-<番号>}"; [[ $DRV_VARIANT == -server* ]] && glpkg+=-server
   if [[ ! -e /usr/lib/x86_64-linux-gnu/libGLX_nvidia.so.0 ]]; then
@@ -748,6 +766,7 @@ check_userspace() {
       else
         finding WARN "glxinfo が OpenGL コンテキストを作れない" "$(head -n3 <<<"$g")"
       fi
+      check_prime_opengl
     else
       missing+=(mesa-utils)
     fi
@@ -961,6 +980,37 @@ check_chrome() {
   return 0
 }
 
+# コマンドの有無は診断範囲の情報であり、GPU の故障とは区別する。
+collect_tools() {
+  sec "診断ツールの有無"
+  note "PATH 上で実行できるコマンドを確認。存在しても、権限や実行環境によって確認が失敗する場合がある。"
+  local cmd package purpose location
+  while IFS='|' read -r cmd package purpose; do
+    if have "$cmd"; then
+      location=$(command -v "$cmd")
+      note "$cmd: あり ($location) / $purpose"
+    else
+      note "$cmd: なし / $purpose / 提供パッケージ: $package"
+    fi
+  done <<'TOOLS'
+lspci|pciutils|PCI デバイスの識別 (ない場合は sysfs で補完)
+modinfo|kmod|ディスク上のモジュールの版・署名の確認
+lsmod|kmod|読み込み中のモジュール一覧
+nvidia-smi|使用ブランチの nvidia-utils パッケージ|GPU とドライバの実地確認
+dkms|dkms|DKMS のビルド・組み込み状況 (ビルド済みモジュールのみなら不要)
+mokutil|mokutil|Secure Boot と MOK の確認 (Secure Boot 無効なら鍵の確認は不要)
+prime-select|nvidia-prime|PRIME の設定確認 (PRIME を使わない構成では不要)
+glxinfo|mesa-utils|OpenGL の実地確認 (画面のあるセッションが必要)
+vulkaninfo|vulkan-tools|Vulkan の実地確認
+python3|python3|Chrome の Local State の解析
+google-chrome|google-chrome-stable など|Google Chrome の版の確認 (他の Chrome / Chromium では別コマンドの場合あり)
+journalctl|systemd|今回・前回の起動ログの取得
+dmesg|util-linux|journalctl で取得できない場合のカーネルログ取得
+ubuntu-drivers|ubuntu-drivers-common|ドライバ候補の一覧
+TOOLS
+  note ""
+}
+
 collect_raw_system() {
   sec "システム"
   note "nvidia-ubuntu-report / $NOW / 実行ユーザー: $(id -un) (EUID $EUID)${SUDO:+ / --sudo 使用}"
@@ -1068,6 +1118,7 @@ main() {
   echo "診断中…" >&2
   collect_facts
   collect_raw_system
+  collect_tools
   check_core
   check_kernels
   check_dkms

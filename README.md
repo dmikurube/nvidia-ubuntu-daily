@@ -40,16 +40,17 @@ sudo apt install mesa-utils vulkan-tools
 
 NVIDIA ドライバは、メモリ上のカーネルモジュール、ディスク上のモジュール、ユーザー空間のライブラリ、パッケージのバージョンがすべて揃っていないと動きません。どこで食い違っているかを中心に調べます。
 
+- 診断ツールの有無、実行パス、用途、ない場合の提供パッケージ (自動インストールはしない)
 - 各バージョンの食い違い (更新後の再起動待ち、モジュールが用意されていない部分更新)
 - インストール済みの各カーネルの nvidia モジュールの有無。次回起動するカーネル (GRUB の設定からの推定) に問題がないか
 - DKMS のビルド状況とビルド失敗の記録 (`/var/log/apt/term.log`、make.log のエラー行)
 - Secure Boot: モジュールの署名、DKMS 署名鍵の MOK 登録、署名拒否のログ
 - 読み込みを妨げる設定: modprobe のブラックリスト、カーネル起動オプション、nouveau、prime-select
 - カーネルログ: `API mismatch`、`RmInitAdapter failed`、Xid エラー、GPU のバス脱落
-- GSP ファームウェア、OpenGL / Vulkan のライブラリと ICD、`.run` インストーラの残骸
+- GSP ファームウェア、OpenGL / Vulkan のライブラリと ICD、`.run` インストーラの残骸。関連ライブラリの複数の版は、独立した版も含むため INFO として表示
 - パッケージ: 途中で止まった設定、hold、バージョンの不揃い、旧ブランチの残り
 - 再起動待ちの更新 (`/run/reboot-required`、起動後の apt 履歴)
-- nvidia-smi、glxinfo、vulkaninfo の実地確認
+- nvidia-smi、glxinfo、vulkaninfo の実地確認。glxinfo は通常の描画と、NVIDIA を明示した PRIME オフロードの両方を確認
 - Chrome: ハードウェアアクセラレーションの設定、GPU 関連のフラグ、起動オプション、GPU プロセスの状態
 
 ## エージェントで診断する
