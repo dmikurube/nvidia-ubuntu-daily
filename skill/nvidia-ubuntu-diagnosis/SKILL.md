@@ -7,6 +7,8 @@ description: "Ubuntu の NVIDIA ドライバ/カーネル診断スクリプト d
 
 ユーザーは自分の Ubuntu マシン (NVIDIA GPU、Chrome 利用) で `dump-nvidia-ubuntu-diagnosis.sh` を実行し、そのレポートを渡してくる。
 
+対象は複数の Ubuntu 24.04 LTS、X11 の GNOME、NVIDIA GPU のマシン。GPU の型番・世代、ドライバのブランチ・版・供給元、カーネルの種類・版、Secure Boot の状態は固定しない。レポートに記録された実行時の情報を使う。特定の版を「最新」と仮定せず、対応 GPU と Ubuntu のパッケージ候補を必要に応じて確認する。
+
 このマシンはエージェントが直接操作できない。エージェントはレポートを読んで原因と手順を示し、コマンドはユーザーが自分で実行する。
 
 やりとりの往復を減らすことが目的なので、できるだけ**一回の返答で結論と手順まで出す**ように努力する。
@@ -27,7 +29,7 @@ description: "Ubuntu の NVIDIA ドライバ/カーネル診断スクリプト d
 
 ## 層ごとの確認
 
-NVIDIA ドライバは次の層がすべて**同じバージョン**でないと動かない。どこで食い違っているかを特定するのが診断の中心。
+NVIDIA のカーネルモジュールと、それに対応するユーザー空間ライブラリは上流バージョンの整合が必要。Ubuntu のパッケージ改訂番号や Linux カーネルの版を NVIDIA の版と一致させる必要はない。どこで食い違っているかを特定するのが診断の中心。
 
 | 層 | レポート上の場所 |
 |---|---|
@@ -36,28 +38,29 @@ NVIDIA ドライバは次の層がすべて**同じバージョン**でないと
 | ユーザー空間ライブラリ | 「ユーザー空間ライブラリ」の版、`libGLX_nvidia.so.0` などのリンク先 |
 | パッケージ | dpkg の一覧 (`nvidia-driver-NNN`、`libnvidia-gl-NNN`、`nvidia-dkms-NNN` など) |
 
-- 読み込み中だけ古く、ディスク上とライブラリが新しい → 更新後の再起動待ち。`nvidia-smi` は `Driver/library version mismatch`、カーネルログに `NVRM: API mismatch`。対処は再起動のみ。
+- 読み込み中だけ古く、ディスク上とライブラリが新しい → 更新後の再起動待ち。`nvidia-smi` は `Driver/library version mismatch`、カーネルログに `NVRM: API mismatch`。次回起動カーネルのモジュールと Secure Boot に問題がなければ、対処は再起動。
 - ディスク上も古い → 新しいモジュールが用意されていない。DKMS のビルド失敗、`nvidia-dkms-NNN` の hold、段階的リリース (phased updates) による部分更新を疑う。
-- モジュールが読み込まれていない → 実行中カーネル用の `nvidia.ko` がない、Secure Boot の署名拒否、ブラックリスト、nouveau が先に掴んでいる、のどれか。
+- モジュールが読み込まれていない → 実行中カーネル用の `nvidia.ko` がない、Secure Boot の署名拒否、ブラックリスト、nouveau が先に掴んでいる、などを調べる。GPU とモジュール種別の非対応や初期化失敗などもあり、列挙した原因に限定しない。
 
 ### Ubuntu のパッケージ構成
 
 - モジュールの供給元は 2 通り。`nvidia-dkms-NNN` (DKMS でビルド、`/lib/modules/<k>/updates/dkms/`) と、Canonical がビルド・署名した `linux-modules-nvidia-NNN-<k>` (`/lib/modules/<k>/kernel/nvidia-NNN*/`)。`-open` が付くのはオープンカーネルモジュール版。
 - `linux-modules-nvidia-*` や `linux-objects-nvidia-*` の旧ブランチ分が大量に残っていても、それ自体は不調の原因ではない。
-- `nvidia-headless-*` や `-server` 系だけでは OpenGL/Vulkan のライブラリ (`libnvidia-gl-NNN`) が入らない。
+- `nvidia-headless-*` は描画用ライブラリを含まない。`-server` は用途別のブランチで、描画用の `libnvidia-gl-NNN-server` もある。名称だけで不足と決めず、実ファイルと依存関係を確認する。
+- 複数ブランチの候補があるときは、一覧の先頭を使用中とみなさない。ライブラリのリンク先、modinfo、パッケージの所有関係を照合する。GPU の対応世代と open / proprietary の要件も確認する。
 - `/usr/bin/nvidia-uninstall` がパッケージ管理外にあれば、NVIDIA 公式 .run インストーラの残骸。apt 版と混在すると更新のたびに壊れる。
 - `nvidia-firmware-NNN-<ver>` は GSP ファームウェア (`/lib/firmware/nvidia/<ver>/`)。モジュールの版と同じディレクトリが要る。
 
 ### カーネルと GRUB
 
 - 「インストール済みカーネルと nvidia モジュール」で、各カーネルにライブラリと同じ版のモジュールがあるかを見る。
-- 次回起動カーネルは推定。`GRUB_DEFAULT=0` なら通常は版の最も新しいカーネル。`saved` や `grubenv` の `saved_entry` / `next_entry` があればそれに従う。
-- 新しいカーネル (HWE や OEM の更新) で DKMS のビルドが失敗するのは典型的な更新起因の障害。`/var/log/apt/term.log` の `Bad return status for module build on kernel: <k>` と make.log の `error:` 行が証拠。ドライバが新しいカーネルに未対応なことが多く、対処は「動くカーネルで起動して対応版のドライバを待つ」。
+- 次回起動カーネルは推定。`GRUB_DEFAULT=0` では生成済み grub.cfg の先頭の起動エントリを確認する。版番号順だけでは OEM / generic などの選択を確定できない。`saved` や `grubenv` の `saved_entry` / `next_entry` があればそれに従う。
+- 新しいカーネル (HWE や OEM の更新) で DKMS のビルドが失敗するのは典型的な更新起因の障害。`/var/log/apt/term.log` の `Bad return status for module build on kernel: <k>` と make.log の `error:` 行が証拠。失敗だけでカーネル未対応と断定せず、ヘッダ不足、コンパイラ、署名やディスク容量などの具体的なエラーを確認する。未対応なら、動くカーネルで起動して対応版を待つ。
 - 実行中カーネルのヘッダ (`linux-headers-<k>`) がなければ DKMS はビルドできない。
 
 ### Secure Boot
 
-- DKMS のモジュールは `/var/lib/shim-signed/mok/MOK.der` の鍵で署名される。この鍵がファームウェアの MOK に登録されていないと、`Loading of module with unavailable key is rejected` や `Key was rejected by service` で読み込みが拒否される。
+- DKMS の署名鍵は通常 `/var/lib/shim-signed/mok/MOK.der`。設定変更や独自署名もあるため、レポートの証明書パスと実際のモジュール署名者を照合する。設定上の鍵が未登録でも、それだけで読み込み拒否の原因と断定しない。実際に使った鍵が信頼されなければ、`Loading of module with unavailable key is rejected` や `Key was rejected by service` で読み込みが拒否される。
 - 登録は `sudo mokutil --import <MOK.der>` → 再起動 → 青い MOK Manager 画面で Enroll MOK。画面は数秒で閉じ、閉じると登録されない。
 - `MOK_STATE` が `unreadable` なのは一般ユーザーで実行したため。判定に影響しないことが多いが、Secure Boot が疑わしいときは `--sudo` 付きでの再実行を頼む。
 - Secure Boot を無効にする案は最後の手段としてのみ挙げる。

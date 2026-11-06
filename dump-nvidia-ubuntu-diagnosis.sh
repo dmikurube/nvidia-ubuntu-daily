@@ -92,6 +92,43 @@ setup() {
 
 # ================================================================ 事実の収集
 
+# 使用中のライブラリの版に合う候補を優先し、一意に決まらなければ選ばない。
+select_driver_packages() {
+  local candidates matches p v target=${USER_VER:-${DISK_VER:-$LOADED_VER}}
+  DRV_PKG="" DRV_BRANCH="" DRV_VARIANT="" PKG_VER="" DKMS_PKG="" DKMS_VER=""
+  candidates=$(awk -F'\t' '$1 ~ /^nvidia-(driver|headless(-no-dkms)?)-[0-9]+(-open|-server|-server-open)?$/ { print }' <<<"$PKG_NV_INST")
+  matches=""
+  while IFS=$'\t' read -r p v; do
+    [[ -n $p ]] || continue
+    [[ -n $target && $(upstream "$v") == "$target" ]] && matches+="$p"$'\t'"$v"$'\n'
+  done <<<"$candidates"
+  [[ -n $matches ]] && candidates=$matches
+  if (( $(nlines "$candidates") == 1 )); then
+    IFS=$'\t' read -r DRV_PKG v <<<"$candidates"
+    PKG_VER=$(upstream "$v")
+    DRV_BRANCH=$(grep -oE '[0-9]+' <<<"$DRV_PKG" | head -n1)
+    DRV_VARIANT=$(sed -E 's/^nvidia-(driver|headless(-no-dkms)?)-[0-9]+//' <<<"$DRV_PKG")
+  else
+    candidates=$(awk -F'\t' -v t="$target" '
+      $1 ~ /^libnvidia-gl-[0-9]+(-server)?$/ {
+        v=$2; sub(/^[0-9]+:/, "", v); sub(/-.*/, "", v)
+        if (v == t) print $1 "\t" v
+      }' <<<"$PKG_NV_INST")
+    if (( $(nlines "$candidates") == 1 )); then
+      IFS=$'\t' read -r p PKG_VER <<<"$candidates"
+      DRV_BRANCH=$(grep -oE '[0-9]+' <<<"$p" | head -n1)
+      [[ $p == *-server ]] && DRV_VARIANT=-server
+      # open / proprietary の違いはディスク上のモジュールから取得する。
+      [[ $(modinfo -F license nvidia 2>/dev/null) == *MIT* ]] && DRV_VARIANT+=-open
+    fi
+  fi
+  if [[ -n $DRV_BRANCH ]]; then
+    p="nvidia-dkms-${DRV_BRANCH}${DRV_VARIANT}"
+    v=$(awk -F'\t' -v p="$p" '$1 == p { print $2 }' <<<"$PKG_NV_INST")
+    if [[ -n $v ]]; then DKMS_PKG=$p; DKMS_VER=$(upstream "$v"); fi
+  fi
+}
+
 collect_facts() {
   local f v d k l
 
@@ -122,27 +159,12 @@ collect_facts() {
   PKG_BROKEN=$(awk -F'\t' '$2 ~ /nvidia|^linux-(image|headers|modules)/ && (substr($1, 2, 1) ~ /[HUFWt]/ || substr($1, 3, 1) == "R")' <<<"$PKG_ALL")
   PKG_HELD=$(awk -F'\t' '$2 ~ /nvidia|^linux-/ && substr($1, 1, 1) == "h" && substr($1, 2, 1) == "i" { print $2 }' <<<"$PKG_ALL")
 
-  DRV_PKG=$(awk -F'\t' '$1 ~ /^nvidia-(driver|headless(-no-dkms)?)-[0-9]+(-open|-server|-server-open)?$/ { print $1; exit }' <<<"$PKG_NV_INST")
-  DRV_BRANCH=$(grep -oE '[0-9]{3,}' <<<"$DRV_PKG" | head -n1)
-  DRV_VARIANT=$(sed -nE 's/^nvidia-(driver|headless(-no-dkms)?)-[0-9]+//p' <<<"$DRV_PKG")
-  PKG_VER=""
-  [[ -n $DRV_PKG ]] && PKG_VER=$(upstream "$(awk -F'\t' -v p="$DRV_PKG" '$1 == p { print $2 }' <<<"$PKG_NV_INST")")
-  if [[ -z $DRV_BRANCH ]]; then
-    local gl; gl=$(awk -F'\t' '$1 ~ /^libnvidia-gl-[0-9]+/ { print $1 "\t" $2; exit }' <<<"$PKG_NV_INST")
-    if [[ -n $gl ]]; then
-      DRV_BRANCH=$(grep -oE '[0-9]{3,}' <<<"${gl%%$'\t'*}" | head -n1)
-      PKG_VER=$(upstream "${gl#*$'\t'}")
-    fi
-  fi
   # ドライバ本体を構成するパッケージの「上流バージョン<TAB>名前」
   PKG_CORE_VERS=$(awk -F'\t' '
     $1 ~ /^(linux-|nvidia-firmware-|nvidia-settings$|nvidia-prime$|libnvidia-egl-(wayland|gbm|xcb|xlib))/ { next }
-    { v = $2; sub(/^[0-9]+:/, "", v); sub(/-.*/, "", v); if (v ~ /^[0-9][0-9][0-9]\./) print v "\t" $1 }' <<<"$PKG_NV_INST")
+    { v = $2; sub(/^[0-9]+:/, "", v); sub(/-.*/, "", v); if (v ~ /^[0-9]+\./) print v "\t" $1 }' <<<"$PKG_NV_INST")
   PKG_CORE_DISTINCT=$(cut -f1 <<<"$PKG_CORE_VERS" | grep . | sort -u)
-  BRANCHES=$(cut -f2 <<<"$PKG_CORE_VERS" | grep -oE -- '-[0-9]{3,}(-|$)' | grep -oE '[0-9]+' | sort -u)
-  DKMS_PKG=$(awk -F'\t' '$1 ~ /^nvidia-dkms-/ { print $1; exit }' <<<"$PKG_NV_INST")
-  DKMS_VER=""
-  [[ -n $DKMS_PKG ]] && DKMS_VER=$(upstream "$(awk -F'\t' -v p="$DKMS_PKG" '$1 == p { print $2 }' <<<"$PKG_NV_INST")")
+  BRANCHES=$(cut -f2 <<<"$PKG_CORE_VERS" | grep -oE -- '-[0-9]+(-|$)' | grep -oE '[0-9]+' | sort -u)
   PREBUILT_KREL=$(awk -F'\t' -v s="-$KREL" '$1 ~ /^linux-modules-nvidia-/ && substr($1, length($1) - length(s) + 1) == s { print $1 }' <<<"$PKG_NV_INST")
 
   # --- ユーザー空間ライブラリ (ファイル名末尾のバージョン)
@@ -151,7 +173,7 @@ collect_facts() {
            /usr/lib/i386-linux-gnu/lib{nvidia-,cuda,GLX_nvidia,EGL_nvidia}*.so.*; do
     [[ -f $f && ! -L $f ]] || continue
     v=${f##*.so.}
-    [[ $v =~ ^[0-9]{3}\.[0-9]+(\.[0-9]+)?$ ]] || continue
+    [[ $v =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || continue
     LIB_VERS[$v]=$(( ${LIB_VERS[$v]:-0} + 1 ))
   done
   USER_VER=""
@@ -159,7 +181,7 @@ collect_facts() {
     v=$(readlink -f "/usr/lib/x86_64-linux-gnu/$f" 2>/dev/null)
     [[ -f $v ]] || continue
     v=${v##*.so.}
-    if [[ $v =~ ^[0-9]{3}\. ]]; then USER_VER=$v; break; fi
+    if [[ $v =~ ^[0-9]+\. ]]; then USER_VER=$v; break; fi
   done
 
   # --- カーネルモジュール
@@ -170,13 +192,14 @@ collect_facts() {
   fi
   if [[ -r /proc/driver/nvidia/version ]]; then
     l=$(grep -m1 NVRM /proc/driver/nvidia/version)
-    [[ -z $LOADED_VER ]] && LOADED_VER=$(grep -oE '[0-9]{3}\.[0-9]+(\.[0-9]+)?' <<<"$l" | head -n1)
+    [[ -z $LOADED_VER ]] && LOADED_VER=$(grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' <<<"$l" | head -n1)
     if [[ $l == *Open* ]]; then LOADED_KIND=open; else LOADED_KIND=proprietary; fi
   fi
   DISK_FILE=$(modinfo -F filename nvidia 2>/dev/null | head -n1)
   DISK_VER=$(modinfo -F version nvidia 2>/dev/null | head -n1)
   DISK_SIGNER=$(modinfo -F signer nvidia 2>/dev/null | head -n1)
   DKMS_MODULE=0; [[ $DISK_FILE == */updates/dkms/* ]] && DKMS_MODULE=1
+  select_driver_packages
   KO_LIST=""
   while IFS= read -r f; do
     KO_LIST+="$f  ($(modinfo -F version "$f" 2>/dev/null))"$'\n'
@@ -200,10 +223,15 @@ collect_facts() {
     done
     [[ -n $NEXT_KERNEL ]] && NEXT_HOW="grubenv の指定"
   fi
-  if [[ -z $NEXT_KERNEL ]] && (( ${#KERNELS[@]} )) &&
+  if [[ -z $NEXT_KERNEL ]] && [[ -r /boot/grub/grub.cfg ]] && (( ${#KERNELS[@]} )) &&
      [[ -z $gd || $gd == 0 || ( $gd == saved && ( -z $se || $se == 0 ) ) ]]; then
-    NEXT_KERNEL=${KERNELS[${#KERNELS[@]}-1]}
-    NEXT_HOW="GRUB_DEFAULT=${gd:-0} なので最新のカーネル"
+    local first_kernel
+    first_kernel=$(awk '$1 == "linux" || $1 == "linuxefi" { for (i=2; i<=NF; i++) if ($i ~ /\/vmlinuz-/) { sub(/^.*\/vmlinuz-/, "", $i); print $i; exit } }' /boot/grub/grub.cfg)
+    for k in "${KERNELS[@]}"; do
+      [[ $k == "$first_kernel" ]] && NEXT_KERNEL=$k
+    done
+    [[ -n $NEXT_KERNEL ]] && NEXT_HOW="GRUB_DEFAULT=${gd:-0}、生成済み grub.cfg の先頭"
+
   fi
 
   # カーネルごとの nvidia モジュールの版と、ライブラリと版が合うカーネル
@@ -297,12 +325,12 @@ collect_facts() {
   # --- Secure Boot が読み込みを妨げているか
   SB_ISSUE=""
   if [[ $SB_ON == 1 ]]; then
-    if (( ! MOD_LOADED )) && [[ -n $SIG_REJECT_LINES ]]; then
+    if (( ! MOD_LOADED )) && [[ -n $SIG_REJECT_LINES ]] && grep -qi nvidia <<<"$SIG_REJECT_LINES"; then
       SB_ISSUE=rejected
     elif [[ -n $DISK_VER && -z $DISK_SIGNER ]]; then
       SB_ISSUE=unsigned
-    elif (( DKMS_MODULE )) && ! [[ $MOD_LOADED == 1 && $LOADED_VER == "$DISK_VER" ]]; then
-      case $MOK_STATE in not-enrolled|no-key|pending) SB_ISSUE=$MOK_STATE ;; esac
+    elif (( DKMS_MODULE )) && [[ $MOK_STATE == pending ]]; then
+      SB_ISSUE=pending
     fi
   fi
 
@@ -330,7 +358,7 @@ $(sed 's/^/    /' <<<"$MAKELOG_ERRORS")
     printf '%s\n' "→ sudo apt install linux-modules-nvidia-${DRV_BRANCH}${DRV_VARIANT}-$k   (このカーネル用のビルド済みモジュール)" \
       "  そのパッケージがなければ sudo apt install nvidia-dkms-${DRV_BRANCH}${DRV_VARIANT} で DKMS ビルドに切り替える"
   else
-    echo "→ sudo ubuntu-drivers install"
+    echo "→ ubuntu-drivers list と apt-cache policy で、この GPU に対応するドライバとインストール済みパッケージの候補を確認する。ブランチを特定できないため自動で修復コマンドを決められない"
   fi
 }
 
@@ -382,6 +410,9 @@ check_core() {
     return
   fi
 
+  [[ -z $DRV_BRANCH ]] && finding WARN "使用するドライバのブランチを一意に特定できない" "複数候補やメタパッケージの欠落が考えられる。生データのパッケージ一覧、ライブラリ、modinfo の版を照合する。
+→ ubuntu-drivers list と apt-cache policy で対応する候補を確認する"
+
   local vers="読み込み中 ${LOADED_VER:-なし} / ディスク上 ${DISK_VER:-なし} / ライブラリ ${USER_VER:-なし}"
   if (( MOD_LOADED )); then
     if [[ -n $USER_VER && $LOADED_VER != "$USER_VER" ]]; then
@@ -390,7 +421,7 @@ check_core() {
         finding FAIL "再起動待ち: メモリ上の nvidia モジュールが更新前のまま" "$vers
 ドライバの更新で新しいモジュールは用意済みだが、読み込まれているのは更新前のもの。
 このままでは OpenGL / Vulkan / CUDA / nvidia-smi がすべて失敗し、ブラウザなどはソフトウェア描画になる。
-→ 再起動する$(sb_reboot_note)"
+→ 下の「次回起動予定」の確認結果を見て、起動先のモジュールに問題がないことを確認してから再起動する$(sb_reboot_note)"
       else
         CORE_STATE=mismatch
         finding FAIL "nvidia モジュールとライブラリのバージョン不一致 (新しいモジュールが用意されていない)" "$vers
@@ -446,14 +477,19 @@ check_kernels() {
     if [[ $k != "$KREL" ]] && [[ -z $v || ( -n $USER_VER && $v != "$USER_VER" ) ]]; then no_mod+=("$k:${v:-なし}"); fi
   done
 
-  [[ -n $NV_GPUS && -n $DRV_BRANCH ]] || return 0
+  [[ -n $NV_GPUS ]] || return 0
 
   if (( $(sed -n 's/.*(\(.*\))$/\1/p' <<<"$KO_LIST" | sort -u | grep -c .) > 1 )); then
     finding WARN "実行中カーネル用に版の違う nvidia.ko が複数ある" "$KO_LIST
 updates/dkms にあるものが優先される (depmod の検索順)。使われないほうは古いパッケージの残り。"
   fi
 
-  if [[ -n $NEXT_KERNEL && $NEXT_KERNEL != "$KREL" ]]; then
+  if [[ -z $NEXT_KERNEL ]]; then
+    NEXT_BAD=1
+    finding WARN "次回起動カーネルを特定できない" "GRUB の設定やカーネルの選択順を確認できない。
+→ 再起動時に GRUB メニューでモジュールの版が合うカーネルを選ぶ (上の一覧を参照)"
+  fi
+  if [[ -n $NEXT_KERNEL ]]; then
     v=${KMOD_VER[$NEXT_KERNEL]:-}
     if [[ -z $v ]]; then
       NEXT_BAD=1
@@ -542,7 +578,7 @@ $how sudo mokutil --import $MOK_CERT (一時パスワードを決める) → 再
 → sudo dpkg-reconfigure ${DKMS_PKG:-nvidia-dkms-<番号>}   (再ビルドと署名)
 → sudo update-secureboot-policy --enroll-key → 再起動 → MOK Manager で Enroll MOK" ;;
     not-enrolled)
-      finding FAIL "Secure Boot: DKMS の署名鍵が MOK に未登録" "モジュールは $MOK_CERT の鍵で署名されるが、その鍵がファームウェアに登録されていないため読み込めない。
+      finding FAIL "Secure Boot: DKMS の署名鍵が MOK に未登録" "設定上の DKMS 署名鍵 $MOK_CERT は未登録。独自の鍵で署名している場合は、実際の署名者との対応も確認する。
 → sudo mokutil --import $MOK_CERT   (一時パスワードを決めて入力)
 → 再起動 → 青い MOK Manager 画面で Enroll MOK → Continue → Yes → パスワード → Reboot" ;;
     no-key)
@@ -555,15 +591,15 @@ $how sudo mokutil --import $MOK_CERT (一時パスワードを決める) → 再
     *)
       if (( DKMS_MODULE )); then
         if [[ $MOK_STATE == enrolled ]]; then
-          finding OK "Secure Boot: 有効、DKMS の署名鍵は登録済み"
+          finding OK "Secure Boot: 有効、設定上の DKMS 署名鍵は登録済み"
         elif (( MOD_LOADED )) && [[ $LOADED_VER == "$DISK_VER" ]]; then
           finding OK "Secure Boot: 有効、現在のモジュールは問題なく読み込めている"
         else
-          finding INFO "Secure Boot: 有効、DKMS の署名鍵の登録状況は未確認" "鍵ファイルを読む権限がない ($MOK_STATE)。
-→ 必要なら --sudo を付けて実行すると確認できる (今回の判定には影響しない)"
+          finding INFO "Secure Boot: 有効、DKMS の署名鍵の登録状況は未確認" "確認結果: $MOK_STATE。実際のモジュール署名者と設定上の証明書の対応は未確認。
+→ 必要なら --sudo を付けて実行すると確認できる (未登録や鍵の欠落だけでは、実際の読み込み拒否の原因とは断定できない)"
         fi
       elif [[ -n $DISK_VER ]]; then
-        finding OK "Secure Boot: 有効、署名済みのビルド済みモジュールを使用"
+        finding INFO "Secure Boot: 有効、ディスク上のモジュールに署名あり" "署名者: $DISK_SIGNER。署名の存在だけでは、このマシンで信頼される鍵かは判断できない。"
       fi ;;
   esac
 }
@@ -664,7 +700,7 @@ check_userspace() {
   fi
   local glpkg="libnvidia-gl-${DRV_BRANCH:-<番号>}"; [[ $DRV_VARIANT == -server* ]] && glpkg+=-server
   if [[ ! -e /usr/lib/x86_64-linux-gnu/libGLX_nvidia.so.0 ]]; then
-    finding FAIL "OpenGL 用ライブラリ (libGLX_nvidia) がない" "headless / server 系のパッケージだけが入っている可能性。
+    finding FAIL "OpenGL 用ライブラリ (libGLX_nvidia) がない" "描画用のライブラリが未導入か、リンクが壊れている可能性。
 → sudo apt install $glpkg"
   fi
   local icd=""
