@@ -92,10 +92,57 @@ setup() {
 
 # ================================================================ 事実の収集
 
-# 説明に明記された移行用パッケージだけを分類する。
-# メタパッケージや oldlibs という分類だけでは、移行用と断定しない。
+# 説明全文と所有ファイルを収集し、明記のない移行用も厳しい条件で判定する。
+collect_package_details() {
+  PKG_NV_DETAILS="" PKG_TRANSITIONAL_EXTRA="" PKG_TRANSITIONAL_REASON=""
+  local p v description files target path has_payload
+  while IFS=$'\t' read -r p v; do
+    [[ -n $p ]] || continue
+    description=$(dpkg-query -W -f='${Description}' "$p" 2>/dev/null)
+    PKG_NV_DETAILS+="[$p] 説明全文:"$'\n'"$description"$'\n'
+    if files=$(dpkg-query -L "$p" 2>/dev/null) && [[ -n $files ]]; then
+      PKG_NV_DETAILS+="所有ファイル一覧:"$'\n'"$files"$'\n\n'
+    else
+      PKG_NV_DETAILS+="所有ファイル一覧: 取得できない"$'\n\n'
+      continue
+    fi
+    if grep -qiE 'transitional (dummy )?package' <<<"$description"; then
+      PKG_TRANSITIONAL_EXTRA+="$p"$'\n'
+      PKG_TRANSITIONAL_REASON+="$p: 説明全文に移行用と明記"$'\n'
+      continue
+    fi
+    target=$(migration_target "$p")
+    [[ -n $target ]] || continue
+    has_payload=0
+    while IFS= read -r path; do
+      case $path in /usr/share/doc|/usr/share/doc/*) continue ;; esac
+      # 文書以外のファイル・シンボリックリンクがあれば実体ありとする。
+      [[ -d $path && ! -L $path ]] || has_payload=1
+    done <<<"$files"
+    if (( ! has_payload )); then
+      PKG_TRANSITIONAL_EXTRA+="$p"$'\n'
+      PKG_TRANSITIONAL_REASON+="$p: 文書とディレクトリのみ、同名の別ブランチ $target だけに依存"$'\n'
+    fi
+  done <<<"$PKG_NV_INST"
+}
+
+# 依存先が単一で、導入済みの同じ役割の別ブランチである場合だけ返す。
+migration_target() {
+  awk -F'\t' -v p="$1" -v installed="$PKG_NV_INST" '
+    BEGIN { n=split(installed, rows, "\n"); for(i=1;i<=n;i++) { split(rows[i], f, "\t"); present[f[1]]=1 } }
+    $1 == p {
+      target=$3
+      if (target !~ /^[a-z0-9][a-z0-9+.-]*$/ || !(target in present)) next
+      old=p; new=target
+      if (!match(old, /-[0-9]+/) || !match(new, /-[0-9]+/)) next
+      sub(/-[0-9]+/, "-BRANCH", old); sub(/-[0-9]+/, "-BRANCH", new)
+      if (old == new && p != target) print target
+    }' <<<"$PKG_NV_META"
+}
+
+# 明記と所有ファイルによる根拠を併用し、メタパッケージという名称だけでは除外しない。
 classify_transitional_packages() {
-  PKG_TRANSITIONAL=$(awk -F'\t' 'tolower($4) ~ /transitional (dummy )?package/ { print $1 }' <<<"$PKG_NV_META" | sort -u)
+  PKG_TRANSITIONAL=$( { awk -F'\t' 'tolower($4) ~ /transitional (dummy )?package/ { print $1 }' <<<"$PKG_NV_META"; printf '%s' "${PKG_TRANSITIONAL_EXTRA:-}"; } | sed '/^$/d' | sort -u)
   PKG_NV_ACTIVE=$(awk -F'\t' -v names="$PKG_TRANSITIONAL" '
     BEGIN { n=split(names, a, "\n"); for (i=1; i<=n; i++) excluded[a[i]]=1 }
     !($1 in excluded)' <<<"$PKG_NV_INST")
@@ -204,6 +251,7 @@ collect_facts() {
   # インストール済みの説明と依存関係を保存。リポジトリの候補版とは区別する。
   PKG_NV_META=$(dpkg-query -W -f='${db:Status-Abbrev}\t${Package}\t${Version}\t${binary:Summary}\t${Depends}\n' '*nvidia*' 2>/dev/null |
     awk -F'\t' 'substr($1, 2, 1) == "i" { print $2 "\t" $3 "\t" $5 "\t" $4 }')
+  collect_package_details
   classify_transitional_packages
 
   # ドライバ本体を構成するパッケージの「上流バージョン<TAB>名前」
@@ -863,8 +911,10 @@ check_packages() {
   sec "NVIDIA 関連パッケージ (dpkg)"
   note "$(awk -F'\t' '{ printf "%s %-48s %s\n", $1, $2, $3 }' <<<"$PKG_NV")" ""
   note "インストール済みパッケージのメタデータ (名前 / 版 / 依存関係 / 説明):" "$PKG_NV_META" ""
+  note "$PKG_NV_DETAILS"
   if [[ -n $PKG_TRANSITIONAL ]]; then
-    finding INFO "移行用と明記された NVIDIA 関連パッケージがある" "$PKG_TRANSITIONAL
+    finding INFO "移行用の NVIDIA 関連パッケージを識別" "$PKG_TRANSITIONAL
+${PKG_TRANSITIONAL_REASON:-説明の要約に移行用と明記}
 これらはドライバ候補の選択と本体の版比較から除外した。旧名の存在だけでは、旧ドライバが使われていることを意味しない。
 → 削除は不要。依存先は生データのインストール済みパッケージのメタデータを参照"
   fi
