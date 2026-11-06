@@ -129,6 +129,39 @@ select_driver_packages() {
   fi
 }
 
+# 生成済み設定を実行せず、標準の menuentry ID と linux 行を照合する。
+# 複数の候補・動的なパス・未対応の指定は空欄として残す。
+grub_entry_kernel() {
+  local entry=$1 config=$2
+  [[ $entry == *'>'* ]] && return 0  # サブメニューの階層指定は未対応
+  awk -v wanted="$entry" '
+    BEGIN { n=split(wanted, parts, ">"); id=parts[n]; active=0; entries=0; kernels=0 }
+    /^[[:space:]]*(menuentry|submenu)[[:space:]]/ {
+      active=0
+      if ($1 != "menuentry") next
+      first++
+      # Ubuntu の生成する --id と $menuentry_id_option の両方に対応。
+      header=$0; gsub(/['"'"'"]/, "", header)
+      count=split(header, words, /[[:space:]]+/); found=""
+      for (i=1; i<=count; i++) {
+        if (words[i] == "--id" || words[i] == "$menuentry_id_option") found=words[i+1]
+        if (words[i] ~ /^--id=/) { found=words[i]; sub(/^--id=/, "", found) }
+      }
+      if ((wanted == "0" && first == 1) || (id !~ /^[0-9]+$/ && found == id)) {
+        active=1; entries++
+      }
+      next
+    }
+    active && ($1 == "linux" || $1 == "linuxefi") {
+      path=$2; gsub(/['"'"'"]/, "", path)
+      if (path !~ /[$`]/ && path ~ /\/vmlinuz-[a-zA-Z0-9.+_-]+$/) {
+        sub(/^.*\/vmlinuz-/, "", path); kernel=path; kernels++
+      } else invalid=1
+    }
+    END { if (entries == 1 && kernels == 1 && !invalid) print kernel }
+  ' "$config"
+}
+
 collect_facts() {
   local f v d k l
 
@@ -213,25 +246,22 @@ collect_facts() {
   NEXT_KERNEL="" NEXT_HOW=""
   local gd se=""
   gd=$(grep -hE '^[[:space:]]*GRUB_DEFAULT=' /etc/default/grub /etc/default/grub.d/*.cfg 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d "\"' ")
-  if [[ -r /boot/grub/grubenv ]]; then
-    se=$(sed -n 's/^next_entry=//p' /boot/grub/grubenv)
-    [[ -z $se && $gd == saved ]] && se=$(sed -n 's/^saved_entry=//p' /boot/grub/grubenv)
-  fi
-  if [[ -n $se ]]; then
-    for k in "${KERNELS[@]}"; do
-      if [[ $se == *"$k"* && ${#k} -gt ${#NEXT_KERNEL} ]]; then NEXT_KERNEL=$k; fi
-    done
-    [[ -n $NEXT_KERNEL ]] && NEXT_HOW="grubenv の指定"
-  fi
-  if [[ -z $NEXT_KERNEL ]] && [[ -r /boot/grub/grub.cfg ]] && (( ${#KERNELS[@]} )) &&
-     [[ -z $gd || $gd == 0 || ( $gd == saved && ( -z $se || $se == 0 ) ) ]]; then
-    local first_kernel
-    first_kernel=$(awk '$1 == "linux" || $1 == "linuxefi" { for (i=2; i<=NF; i++) if ($i ~ /\/vmlinuz-/) { sub(/^.*\/vmlinuz-/, "", $i); print $i; exit } }' /boot/grub/grub.cfg)
-    for k in "${KERNELS[@]}"; do
-      [[ $k == "$first_kernel" ]] && NEXT_KERNEL=$k
-    done
-    [[ -n $NEXT_KERNEL ]] && NEXT_HOW="GRUB_DEFAULT=${gd:-0}、生成済み grub.cfg の先頭"
-
+  local grub_env
+  grub_env=$($SUDO cat /boot/grub/grubenv 2>/dev/null)
+  se=$(sed -n 's/^next_entry=//p' <<<"$grub_env")
+  [[ -z $se && $gd == saved ]] && se=$(sed -n 's/^saved_entry=//p' <<<"$grub_env")
+  local entry=${se:-${gd:-0}} grub_config="$WORK/grub.cfg" candidate=""
+  # --sudo でも読み取りだけを行い、取得した設定は一時ディレクトリに置く。
+  if $SUDO cat /boot/grub/grub.cfg >"$grub_config" 2>/dev/null; then
+    if [[ $entry != saved ]]; then
+      candidate=$(grub_entry_kernel "$entry" "$grub_config")
+      for k in "${KERNELS[@]}"; do
+        [[ $k == "$candidate" ]] && NEXT_KERNEL=$k
+      done
+    fi
+    NEXT_HOW="生成済み grub.cfg、選択指定: $entry"
+  else
+    NEXT_HOW="grub.cfg を読めない、選択指定: $entry"
   fi
 
   # カーネルごとの nvidia モジュールの版と、ライブラリと版が合うカーネル
@@ -1029,7 +1059,7 @@ collect_raw_system() {
   run "cat /sys/module/nvidia_drm/parameters/modeset /sys/module/nvidia_drm/parameters/fbdev"
   sec "ブート設定とカーネルパッケージ"
   run "grep -hE '^(GRUB_DEFAULT|GRUB_CMDLINE_LINUX_DEFAULT|GRUB_CMDLINE_LINUX)=' /etc/default/grub /etc/default/grub.d/*.cfg 2>/dev/null"
-  run "grep -E '^(saved_entry|next_entry)=' /boot/grub/grubenv"
+  run "${SUDO:+$SUDO }grep -E '^(saved_entry|next_entry)=' /boot/grub/grubenv"
   run "dpkg-query -W -f='\${db:Status-Abbrev} \${Package} \${Version}\n' 'linux-image-*' 'linux-headers-*' 'linux-oem-*' 'linux-generic*' 2>/dev/null | grep -vE '^(un|pn)'"
   if (( EUID == 0 )); then
     finding INFO "root で実行された" "OpenGL や Chrome の確認はログイン中のユーザーの環境でないと正確でない。一般ユーザーで実行し、権限が要る確認は --sudo を使う。"

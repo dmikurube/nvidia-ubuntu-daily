@@ -17,7 +17,7 @@ Ubuntu 24.04 + NVIDIA GPU のマシンでは、ドライバやカーネルの更
 2. **ユーザーのマシンでシステムを変えるコマンドを実行しない。** `sudo`、`apt`、`modprobe`、`mokutil --import`、`update-grub`、`dkms` などは、必要ならユーザーに提示して実行してもらう。`./dump-nvidia-ubuntu-diagnosis.sh` (`--sudo` なし) は読み取りだけなので実行してよい。ただし、出たレポートはコミットしない (ホスト名などを含む。`.gitignore` で `nvidia-ubuntu-report-*.txt` を除外済み)。
 3. **終了コードの約束を変えない。** 0 = 問題なし、1 = WARN あり、2 = FAIL あり。
 4. **Ubuntu 24.04 の標準環境で動くこと。** bash 5.2、awk は **mawk** (gawk 専用の機能は使わない: `gensub`、`strftime`、`asort`、配列の配列など)、GNU の coreutils / sed / grep。Python は `chrome_local_state` で使っているだけで、なくても動く。
-5. 表示、レポート、コメント、コミットメッセージは日本語。
+5. 表示、レポート、コード内のコメントは日本語。コミットメッセージは英語。
 
 ## よく使うコマンド
 
@@ -82,7 +82,7 @@ GPU の型番・世代、ドライバのブランチ・バージョン・モジ�
 次の点は、想定した出力の文言をもとに判定していて、実機の出力で確かめていない。実際の出力が手に入ったら、判定を合わせる。
 
 - Chrome の GPU プロセスの起動オプションから「GPU を使っていない」と推定する判定 (`--use-angle=swiftshader-webgl`、`--use-gl=disabled`、`--disable-gpu-compositing` を手がかりにしている)
-- 次回起動カーネルの推定 (GRUB は版の新しいカーネルを先頭に置く前提。`GRUB_FLAVOUR_ORDER` などは見ていない)
+- 次回起動カーネルの推定 (生成済み grub.cfg のエントリ ID または先頭項目を照合。複雑な条件分岐や別設定への移動などは完全には解釈しない)
 - Secure Boot の署名拒否のログの文言、`mokutil --test-key` の出力の文言
 - `--sudo` の経路
 

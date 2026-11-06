@@ -57,7 +57,7 @@ NVIDIA のカーネルモジュールと、それに対応するユーザー空�
 ### カーネルと GRUB
 
 - 「インストール済みカーネルと nvidia モジュール」で、各カーネルにライブラリと同じ版のモジュールがあるかを見る。
-- 次回起動カーネルは推定。`GRUB_DEFAULT=0` では生成済み grub.cfg の先頭の起動エントリを確認する。版番号順だけでは OEM / generic などの選択を確定できない。`saved` や `grubenv` の `saved_entry` / `next_entry` があればそれに従う。
+- 次回起動カーネルは推定。`GRUB_DEFAULT=0` では生成済み grub.cfg の先頭の起動エントリを確認する。版番号順だけでは OEM / generic などの選択を確定できない。`saved` や `grubenv` の `saved_entry` / `next_entry` があればそれに従う。保存エントリ ID は生成済み grub.cfg の menuentry と照合し、linux 行のカーネルを推定する。未対応の階層指定・番号指定・タイトル指定、動的なパス、複数候補、読み取り不可では不明になる。不明をモジュール欠落と同一視しない。
 - 新しいカーネル (HWE や OEM の更新) で DKMS のビルドが失敗するのは典型的な更新起因の障害。`/var/log/apt/term.log` の `Bad return status for module build on kernel: <k>` と make.log の `error:` 行が証拠。失敗だけでカーネル未対応と断定せず、ヘッダ不足、コンパイラ、署名やディスク容量などの具体的なエラーを確認する。未対応なら、動くカーネルで起動して対応版を待つ。
 - 実行中カーネルのヘッダ (`linux-headers-<k>`) がなければ DKMS はビルドできない。
 
