@@ -46,7 +46,7 @@ NVIDIA ドライバは、メモリ上のカーネルモジュール、ディス�
 - DKMS のビルド状況とビルド失敗の記録 (`/var/log/apt/term.log`、make.log のエラー行)
 - Secure Boot: モジュールの署名、DKMS 署名鍵の MOK 登録、署名拒否のログ
 - 読み込みを妨げる設定: modprobe のブラックリスト、カーネル起動オプション、nouveau、prime-select
-- カーネルログ: `API mismatch`、`RmInitAdapter failed`、Xid エラー、GPU のバス脱落
+- カーネルログ: `API mismatch`、`RmInitAdapter failed`、Xid エラー、GPU のバス脱落。`PRH failed to update thermal limit!` は回数とログを INFO として示し、nvidia-smi が正常なら温度・性能制限理由・電力も記録 (このメッセージだけでは過熱や故障と判定しない)
 - GSP ファームウェア、OpenGL / Vulkan のライブラリと ICD、`.run` インストーラの残骸。関連ライブラリの複数の版は、独立した版も含むため INFO として表示
 - パッケージ: 途中で止まった設定、hold、バージョンの不揃い、旧ブランチの残り。インストール済みの説明・依存関係も記録し、説明に移行用と明記されたパッケージは INFO として示してドライバ候補の選択・本体の版比較から除外
 - 再起動待ちの更新 (`/run/reboot-required`、起動後の apt 履歴)

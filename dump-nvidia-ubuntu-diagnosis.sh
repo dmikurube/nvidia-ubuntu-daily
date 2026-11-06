@@ -673,6 +673,17 @@ check_blockers() {
   return 0
 }
 
+# ジャーナルの warning 節との重複を避け、今回のカーネルログだけを数える。
+check_thermal_limit_log() {
+  local lines count
+  lines=$(grep -F 'PRH failed to update thermal limit!' <<<"$NVLOG")
+  [[ -n $lines ]] || return 0
+  count=$(nlines "$lines")
+  finding INFO "カーネルログ: 温度制限の更新失敗を記録 (今回の起動で $count 件)" "$(headtail 2 2 <<<"$lines")
+ドライバ内部の温度制限の更新処理に関するメッセージ。この記録だけでは、過熱・温度保護の無効化・性能低下・故障とは判断できない。
+→ 性能低下や復帰失敗などの症状がある場合は、nvidia-smi -q -d TEMPERATURE,PERFORMANCE,POWER で現在の温度・性能制限理由・電力を確認し、生データの今回/前回の起動ログと症状の発生時刻を照合する (読み取りのみ、再起動不要)"
+}
+
 check_kernel_log() {
   sec "カーネルログ (今回の起動、NVIDIA 関連)"
   if [[ -z $KLOG_SRC ]]; then
@@ -681,6 +692,7 @@ check_kernel_log() {
   else
     note "取得元: $KLOG_SRC"
     printf '%s\n' "$NVLOG" | headtail 60 160 >>"$RAW"
+    check_thermal_limit_log
     local l
     if [[ $CORE_STATE != reboot && $CORE_STATE != mismatch ]]; then
       l=$(grep -m3 'API mismatch' <<<"$NVLOG")
@@ -782,6 +794,9 @@ check_userspace() {
     if (( rc == 0 )); then
       finding OK "nvidia-smi: 正常 (${out//$'\n'/; })"
       run "nvidia-smi -q" 150
+      if grep -qF 'PRH failed to update thermal limit!' <<<"$NVLOG"; then
+        run "nvidia-smi -q -d TEMPERATURE,PERFORMANCE,POWER" 200
+      fi
     elif [[ $out == *mismatch* ]]; then
       [[ $CORE_STATE == reboot || $CORE_STATE == mismatch ]] || finding FAIL "nvidia-smi: Driver/library version mismatch" "$out"
     elif [[ $CORE_STATE != notloaded ]]; then
