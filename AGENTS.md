@@ -18,6 +18,7 @@ Ubuntu 24.04 + NVIDIA GPU のマシンでは、ドライバやカーネルの更
 3. **終了コードの約束を変えない。** 0 = 問題なし、1 = WARN あり、2 = FAIL あり。
 4. **Ubuntu 24.04 の標準環境で動くこと。** bash 5.2、awk は **mawk** (gawk 専用の機能は使わない: `gensub`、`strftime`、`asort`、配列の配列など)、GNU の coreutils / sed / grep。Python は `chrome_local_state` で使っているだけで、なくても動く。
 5. 表示、レポート、コード内のコメントは日本語。コミットメッセージは英語。
+6. コミットの author date / committer date は、作業環境のローカルタイムゾーンを尊重する。UTC に固定しない。
 
 ## よく使うコマンド
 

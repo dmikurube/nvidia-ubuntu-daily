@@ -92,11 +92,20 @@ setup() {
 
 # ================================================================ 事実の収集
 
+# 説明に明記された移行用パッケージだけを分類する。
+# メタパッケージや oldlibs という分類だけでは、移行用と断定しない。
+classify_transitional_packages() {
+  PKG_TRANSITIONAL=$(awk -F'\t' 'tolower($4) ~ /transitional (dummy )?package/ { print $1 }' <<<"$PKG_NV_META" | sort -u)
+  PKG_NV_ACTIVE=$(awk -F'\t' -v names="$PKG_TRANSITIONAL" '
+    BEGIN { n=split(names, a, "\n"); for (i=1; i<=n; i++) excluded[a[i]]=1 }
+    !($1 in excluded)' <<<"$PKG_NV_INST")
+}
+
 # 使用中のライブラリの版に合う候補を優先し、一意に決まらなければ選ばない。
 select_driver_packages() {
   local candidates matches p v target=${USER_VER:-${DISK_VER:-$LOADED_VER}}
   DRV_PKG="" DRV_BRANCH="" DRV_VARIANT="" PKG_VER="" DKMS_PKG="" DKMS_VER=""
-  candidates=$(awk -F'\t' '$1 ~ /^nvidia-(driver|headless(-no-dkms)?)-[0-9]+(-open|-server|-server-open)?$/ { print }' <<<"$PKG_NV_INST")
+  candidates=$(awk -F'\t' '$1 ~ /^nvidia-(driver|headless(-no-dkms)?)-[0-9]+(-open|-server|-server-open)?$/ { print }' <<<"$PKG_NV_ACTIVE")
   matches=""
   while IFS=$'\t' read -r p v; do
     [[ -n $p ]] || continue
@@ -113,7 +122,7 @@ select_driver_packages() {
       $1 ~ /^libnvidia-gl-[0-9]+(-server)?$/ {
         v=$2; sub(/^[0-9]+:/, "", v); sub(/-.*/, "", v)
         if (v == t) print $1 "\t" v
-      }' <<<"$PKG_NV_INST")
+      }' <<<"$PKG_NV_ACTIVE")
     if (( $(nlines "$candidates") == 1 )); then
       IFS=$'\t' read -r p PKG_VER <<<"$candidates"
       DRV_BRANCH=$(grep -oE '[0-9]+' <<<"$p" | head -n1)
@@ -124,7 +133,7 @@ select_driver_packages() {
   fi
   if [[ -n $DRV_BRANCH ]]; then
     p="nvidia-dkms-${DRV_BRANCH}${DRV_VARIANT}"
-    v=$(awk -F'\t' -v p="$p" '$1 == p { print $2 }' <<<"$PKG_NV_INST")
+    v=$(awk -F'\t' -v p="$p" '$1 == p { print $2 }' <<<"$PKG_NV_ACTIVE")
     if [[ -n $v ]]; then DKMS_PKG=$p; DKMS_VER=$(upstream "$v"); fi
   fi
 }
@@ -192,10 +201,15 @@ collect_facts() {
   PKG_BROKEN=$(awk -F'\t' '$2 ~ /nvidia|^linux-(image|headers|modules)/ && (substr($1, 2, 1) ~ /[HUFWt]/ || substr($1, 3, 1) == "R")' <<<"$PKG_ALL")
   PKG_HELD=$(awk -F'\t' '$2 ~ /nvidia|^linux-/ && substr($1, 1, 1) == "h" && substr($1, 2, 1) == "i" { print $2 }' <<<"$PKG_ALL")
 
+  # インストール済みの説明と依存関係を保存。リポジトリの候補版とは区別する。
+  PKG_NV_META=$(dpkg-query -W -f='${db:Status-Abbrev}\t${Package}\t${Version}\t${binary:Summary}\t${Depends}\n' '*nvidia*' 2>/dev/null |
+    awk -F'\t' 'substr($1, 2, 1) == "i" { print $2 "\t" $3 "\t" $5 "\t" $4 }')
+  classify_transitional_packages
+
   # ドライバ本体を構成するパッケージの「上流バージョン<TAB>名前」
   PKG_CORE_VERS=$(awk -F'\t' '
     $1 ~ /^(linux-|nvidia-firmware-|nvidia-settings$|nvidia-prime$|libnvidia-egl-(wayland|gbm|xcb|xlib))/ { next }
-    { v = $2; sub(/^[0-9]+:/, "", v); sub(/-.*/, "", v); if (v ~ /^[0-9]+\./) print v "\t" $1 }' <<<"$PKG_NV_INST")
+    { v = $2; sub(/^[0-9]+:/, "", v); sub(/-.*/, "", v); if (v ~ /^[0-9]+\./) print v "\t" $1 }' <<<"$PKG_NV_ACTIVE")
   PKG_CORE_DISTINCT=$(cut -f1 <<<"$PKG_CORE_VERS" | grep . | sort -u)
   BRANCHES=$(cut -f2 <<<"$PKG_CORE_VERS" | grep -oE -- '-[0-9]+(-|$)' | grep -oE '[0-9]+' | sort -u)
   PREBUILT_KREL=$(awk -F'\t' -v s="-$KREL" '$1 ~ /^linux-modules-nvidia-/ && substr($1, length($1) - length(s) + 1) == s { print $1 }' <<<"$PKG_NV_INST")
@@ -833,6 +847,12 @@ Vulkan と、それを使う WebGPU などが NVIDIA を使えない。"
 check_packages() {
   sec "NVIDIA 関連パッケージ (dpkg)"
   note "$(awk -F'\t' '{ printf "%s %-48s %s\n", $1, $2, $3 }' <<<"$PKG_NV")" ""
+  note "インストール済みパッケージのメタデータ (名前 / 版 / 依存関係 / 説明):" "$PKG_NV_META" ""
+  if [[ -n $PKG_TRANSITIONAL ]]; then
+    finding INFO "移行用と明記された NVIDIA 関連パッケージがある" "$PKG_TRANSITIONAL
+これらはドライバ候補の選択と本体の版比較から除外した。旧名の存在だけでは、旧ドライバが使われていることを意味しない。
+→ 削除は不要。依存先は生データのインストール済みパッケージのメタデータを参照"
+  fi
   run "apt-mark showhold 2>/dev/null"
   run "dpkg --audit 2>&1 | head -n 30"
   run "ubuntu-drivers list 2>/dev/null" 30
