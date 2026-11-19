@@ -95,12 +95,14 @@ setup() {
 # 説明全文と所有ファイルを収集し、明記のない移行用も厳しい条件で判定する。
 collect_package_details() {
   PKG_NV_DETAILS="" PKG_TRANSITIONAL_EXTRA="" PKG_TRANSITIONAL_REASON=""
+  declare -gA PKG_FILES=()
   local p v description files target path has_payload
   while IFS=$'\t' read -r p v; do
     [[ -n $p ]] || continue
     description=$(dpkg-query -W -f='${Description}' "$p" 2>/dev/null)
     PKG_NV_DETAILS+="[$p] 説明全文:"$'\n'"$description"$'\n'
     if files=$(dpkg-query -L "$p" 2>/dev/null) && [[ -n $files ]]; then
+      PKG_FILES[$p]=$files
       PKG_NV_DETAILS+="所有ファイル一覧:"$'\n'"$files"$'\n\n'
     else
       PKG_NV_DETAILS+="所有ファイル一覧: 取得できない"$'\n\n'
@@ -949,6 +951,54 @@ ${PKG_TRANSITIONAL_REASON:-説明の要約に移行用と明記}
   return 0
 }
 
+# 版別ディレクトリ以外の実体を所有する場合は、自動で不要とは判断しない。
+firmware_package_payload() {
+  local p=$1 version=$2 path found=0
+  [[ -n ${PKG_FILES[$p]:-} ]] || return 1
+  while IFS= read -r path; do
+    case $path in
+      /usr/share/doc|/usr/share/doc/*|/usr/share/lintian/overrides/*) continue ;;
+      /lib/firmware/nvidia/"$version"/*|/usr/lib/firmware/nvidia/"$version"/*)
+        [[ -f $path && -r $path && ! -L $path ]] || return 1
+        found=1 ;;
+      *) [[ -d $path && ! -L $path ]] || return 1 ;;
+    esac
+  done <<<"${PKG_FILES[$p]}"
+  (( found ))
+}
+
+# 全カーネルと現在の版を確認し、必要な版のファームウェアが削除後も残る場合だけ識別。
+unused_firmware_candidate() {
+  local p=$1 removed=$2 version k needed needed_version q pv retained
+  [[ $p =~ ^nvidia-firmware-[0-9]+-([0-9]+\.[0-9]+(\.[0-9]+)?)$ ]] || return 1
+  version=${BASH_REMATCH[1]}
+  [[ -n $LOADED_VER && -n $DISK_VER && -n $USER_VER ]] || return 1
+  (( ${#KERNELS[@]} )) || return 1
+  needed=$(printf '%s\n' "$LOADED_VER" "$DISK_VER" "$USER_VER")
+  for k in "${KERNELS[@]}"; do
+    [[ -n ${KMOD_VER[$k]:-} ]] || return 1
+    needed+=$'\n'"${KMOD_VER[$k]}"
+  done
+  # 起動先が不明でも全インストール済みカーネルを確認する。判明している起動先も照合。
+  if [[ -n $NEXT_KERNEL ]]; then
+    [[ -n ${KMOD_VER[$NEXT_KERNEL]:-} ]] || return 1
+    needed+=$'\n'"${KMOD_VER[$NEXT_KERNEL]}"
+  fi
+  firmware_package_payload "$p" "$version" || return 1
+  while IFS= read -r needed_version; do
+    [[ $needed_version != "$version" ]] || return 1
+    retained=""
+    while IFS=$'\t' read -r q pv; do
+      [[ $q =~ ^nvidia-firmware-[0-9]+-([0-9]+\.[0-9]+(\.[0-9]+)?)$ ]] || continue
+      [[ ${BASH_REMATCH[1]} == "$needed_version" ]] || continue
+      grep -qxF "$q" <<<"$removed" && continue
+      if firmware_package_payload "$q" "$needed_version"; then retained=$q; break; fi
+    done <<<"$PKG_NV_INST"
+    [[ -n $retained ]] || return 1
+  done < <(sort -u <<<"$needed")
+  printf '%s: 所有するファームウェアの版 %s は現在・ディスク上・全カーネルで未使用。必要な版のパッケージと実体は削除後も残る' "$p" "$version"
+}
+
 # 削除は実行せず、APT が計算した削除予定を現在の診断情報と照合する。
 check_autoremove() {
   sec "自動削除のシミュレーション"
@@ -957,7 +1007,7 @@ check_autoremove() {
     finding INFO "自動削除の候補を確認できない" "→ apt-get が利用できる環境で apt-get --simulate autoremove を実行する (削除しない)"
     return 0
   fi
-  local out rc candidates p base target safe="" review="" other=""
+  local out rc candidates removed p base target reason safe="" firmware="" review="" other=""
   note '$ apt-get --simulate autoremove'
   out=$(LC_ALL=C timeout 40 apt-get --simulate autoremove 2>&1); rc=$?
   # 削除予定や失敗理由が欠けないよう、この出力は省略しない。
@@ -977,13 +1027,16 @@ check_autoremove() {
     fi
     return 0
   fi
+  removed=$(sed 's/:[^:]*$//' <<<"$candidates")
   while IFS= read -r p; do
     base=${p%%:*}
     if [[ $base == *nvidia* || $base == linux-* ]]; then
       # 移行先も削除される場合は、移行用でも安全側に扱わない。
       target=$(migration_target "$base")
-      if grep -qxF "$base" <<<"$PKG_TRANSITIONAL" && [[ -n $target ]] && ! grep -qxF "$target" <<<"$(sed 's/:[^:]*$//' <<<"$candidates")"; then
+      if grep -qxF "$base" <<<"$PKG_TRANSITIONAL" && [[ -n $target ]] && ! grep -qxF "$target" <<<"$removed"; then
         safe+="$p → $target (移行先は削除予定にない)"$'\n'
+      elif reason=$(unused_firmware_candidate "$base" "$removed"); then
+        firmware+="$reason"$'\n'
       else
         review+="$p"$'\n'
       fi
@@ -995,6 +1048,11 @@ check_autoremove() {
     finding INFO "自動削除の候補に移行用 NVIDIA パッケージがある" "$safe
 移行用と識別でき、導入済みの移行先は削除予定にない。これらの旧名パッケージの削除によるドライバ本体の喪失は見込まれないが、自動削除全体の安全性は別途確認する。
 → 生データの削除予定全体を確認する。実行直前にも apt-get --simulate autoremove で再確認する"
+  fi
+  if [[ -n $firmware ]]; then
+    finding INFO "自動削除の候補に使用対象でない NVIDIA ファームウェアがある" "$firmware
+今回確認できた現在・ディスク上のモジュールと全インストール済みカーネルに必要な版は残る。手動で退避したモジュールや今後のダウングレード用途は対象外。
+→ 実行直前に apt-get --simulate autoremove で候補を再確認する。他の削除候補の安全性は別途確認する"
   fi
   if [[ -n $review ]]; then
     finding WARN "自動削除の候補に確認が必要な GPU / カーネル関連パッケージがある" "$review
