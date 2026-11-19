@@ -949,6 +949,66 @@ ${PKG_TRANSITIONAL_REASON:-説明の要約に移行用と明記}
   return 0
 }
 
+# 削除は実行せず、APT が計算した削除予定を現在の診断情報と照合する。
+check_autoremove() {
+  sec "自動削除のシミュレーション"
+  if ! have apt-get; then
+    note "(apt-get コマンドなし)"
+    finding INFO "自動削除の候補を確認できない" "→ apt-get が利用できる環境で apt-get --simulate autoremove を実行する (削除しない)"
+    return 0
+  fi
+  local out rc candidates p base target safe="" review="" other=""
+  note '$ apt-get --simulate autoremove'
+  out=$(LC_ALL=C timeout 40 apt-get --simulate autoremove 2>&1); rc=$?
+  # 削除予定や失敗理由が欠けないよう、この出力は省略しない。
+  note "$out" "[exit $rc]" ""
+  if (( rc != 0 )); then
+    finding INFO "自動削除の候補を確認できない" "シミュレーションが失敗した (終了コード $rc)。候補なしとは判断しない。
+→ 生データのエラーを確認し、apt-get --simulate autoremove を再実行する (削除しない)"
+    return 0
+  fi
+  candidates=$(awk '$1 == "Remv" || $1 == "Purg" { print $2 }' <<<"$out" | sort -u)
+  if [[ -z $candidates ]]; then
+    # 未知の出力形式を「候補なし」にしない。
+    if grep -qE '(^|, )0 to remove([ ,.]|$)' <<<"$out"; then
+      finding INFO "自動削除のシミュレーション: 削除候補なし"
+    else
+      finding INFO "自動削除の出力を判定できない" "→ 生データの apt-get --simulate autoremove の出力を確認する"
+    fi
+    return 0
+  fi
+  while IFS= read -r p; do
+    base=${p%%:*}
+    if [[ $base == *nvidia* || $base == linux-* ]]; then
+      # 移行先も削除される場合は、移行用でも安全側に扱わない。
+      target=$(migration_target "$base")
+      if grep -qxF "$base" <<<"$PKG_TRANSITIONAL" && [[ -n $target ]] && ! grep -qxF "$target" <<<"$(sed 's/:[^:]*$//' <<<"$candidates")"; then
+        safe+="$p → $target (移行先は削除予定にない)"$'\n'
+      else
+        review+="$p"$'\n'
+      fi
+    else
+      other+="$p"$'\n'
+    fi
+  done <<<"$candidates"
+  if [[ -n $safe ]]; then
+    finding INFO "自動削除の候補に移行用 NVIDIA パッケージがある" "$safe
+移行用と識別でき、導入済みの移行先は削除予定にない。これらの旧名パッケージの削除によるドライバ本体の喪失は見込まれないが、自動削除全体の安全性は別途確認する。
+→ 生データの削除予定全体を確認する。実行直前にも apt-get --simulate autoremove で再確認する"
+  fi
+  if [[ -n $review ]]; then
+    finding WARN "自動削除の候補に確認が必要な GPU / カーネル関連パッケージがある" "$review
+移行用パッケージだけとは確認できない。旧ファームウェアや予備カーネルの場合もあり、この所見だけで削除が危険とも安全とも断定しない。
+→ 自動削除は保留し、所有ファイル・依存関係を今回のモジュール / ライブラリの版、各カーネル、次回起動予定と照合する。読み込み中の版だけで判断しない"
+  fi
+  if [[ -n $other ]]; then
+    finding INFO "自動削除の候補に NVIDIA 以外のパッケージがある" "$other
+この GPU 診断だけでは、他の用途で必要か判断できない。
+→ 生データの削除予定全体を確認し、使用しているアプリやサービスに必要なものがないか確認する"
+  fi
+  note "候補は採取時点のパッケージ情報と APT の設定に基づく。一般ユーザーでは読めない設定がある場合、実際の削除予定と異なる可能性がある。"
+}
+
 # apt の履歴から NVIDIA / カーネル関連の操作を「開始日時<TAB>-<TAB>内容」で古い順に出す
 # (引数でファイルを渡すと、そのファイルを読む)
 # shellcheck disable=SC2120
@@ -1121,6 +1181,7 @@ python3|python3|Chrome の Local State の解析
 google-chrome|google-chrome-stable など|Google Chrome の版の確認 (他の Chrome / Chromium では別コマンドの場合あり)
 journalctl|systemd|今回・前回の起動ログの取得
 dmesg|util-linux|journalctl で取得できない場合のカーネルログ取得
+apt-get|apt|自動削除のシミュレーション (削除しない)
 ubuntu-drivers|ubuntu-drivers-common|ドライバ候補の一覧
 TOOLS
   note ""
@@ -1243,6 +1304,7 @@ main() {
   check_firmware
   check_userspace
   check_packages
+  check_autoremove
   check_updates
   check_services
   check_chrome

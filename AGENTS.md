@@ -42,6 +42,8 @@ Ubuntu 24.04 + NVIDIA GPU のマシンでは、ドライバやカーネルの更
 3. `check_*`: 順に実行し、生データを `sec` / `note` / `run` で記録し、所見を `finding LEVEL TITLE BODY` で追加する。
    - `check_core` が `CORE_STATE` (`ok` / `nogpu` / `nodriver` / `reboot` / `mismatch` / `nolib` / `notloaded`) を決め、後の関数はこれを見て重複する所見を出さない (例: 再起動待ちのとき nvidia-smi の mismatch は所見にしない)。
    - `check_kernels` が `NEXT_BAD` を決め、`check_updates` が再起動を勧めるかどうかに使う。
+   - `check_autoremove` は `check_packages` の後に `apt-get --simulate autoremove` を実行し、「自動削除のシミュレーション」節に出力全体と終了コードを記録する。実際の削除はしない。移行先が導入済みで削除予定にない移行用 NVIDIA パッケージは INFO、追加照合が必要な GPU / カーネル関連候補は WARN、その他の用途の候補は INFO とする。
+   - 自動削除の WARN は故障や削除の危険性が確定したという意味ではない。旧ファームウェア・予備カーネルも含むため、所有ファイルと依存関係を現在・ディスク上のモジュール、各カーネル、次回起動先と照合する。移行用の候補が問題なくても、自動削除全体の安全性は保証しない。シミュレーション失敗・タイムアウト・未知の出力は「候補なし」と区別し、一般ユーザーで読めない APT 設定や採取後の状態変化にも注意する。
 4. `write_report` → `render_summary`: 所見は FAIL → WARN → INFO → OK の順に、同じレベルの中は追加した順に表示する。**根本原因の所見が先に出るよう、追加する順番を意識する。**
 
 所見の書き方の約束:
