@@ -18,6 +18,7 @@ description: "Ubuntu の NVIDIA ドライバ/カーネル診断スクリプト d
 - 前半: 自動判定。概要 (カーネル、GPU、ドライバの各バージョン、Secure Boot、セッション) と `[FAIL]` `[WARN]` `[INFO]` `[ OK ]` の所見。
 - 後半: `######## 見出し ########` ごとの生データ。`$ コマンド` の行に続いて出力がある。`[exit N]` は終了コード (grep の 1 は「一致なし」)。
   主な見出し: システム、診断ツールの有無、GPU (lspci)、カーネルモジュール、ブート設定とカーネルパッケージ、インストール済みカーネルと nvidia モジュール、DKMS、Secure Boot、モジュールの読み込みを妨げる設定、カーネルログ (今回/前回の起動)、システムジャーナル、GSP ファームウェア、ユーザー空間ライブラリ、nvidia-smi、OpenGL / Vulkan の実地確認、Xorg ログ、NVIDIA 関連パッケージ、自動削除のシミュレーション、再起動待ちと最近の更新、systemd、Chrome / Chromium、添付: <ファイル> (chrome://gpu のコピーなど)。
+- 既定で、説明後に sudo 認証を確認し、権限が必要な読み取りだけに使用する。`--no-sudo` 指定、sudo 不在、認証不可の場合は一般ユーザーで読める範囲だけ収集する。非対話実行ではパスワードを求めない。認証できても途中で権限を利用できなくなる場合があるので、各節の実出力を確認する。
 - `--redact` 付きならホスト名は `<host>`、ユーザー名は `<user>`。
 
 ## 進め方
@@ -74,7 +75,7 @@ NVIDIA のカーネルモジュールと、それに対応するユーザー空�
 
 - DKMS の署名鍵は通常 `/var/lib/shim-signed/mok/MOK.der`。設定変更や独自署名もあるため、レポートの証明書パスと実際のモジュール署名者を照合する。設定上の鍵が未登録でも、それだけで読み込み拒否の原因と断定しない。実際に使った鍵が信頼されなければ、`Loading of module with unavailable key is rejected` や `Key was rejected by service` で読み込みが拒否される。
 - 登録は `sudo mokutil --import <MOK.der>` → 再起動 → 青い MOK Manager 画面で Enroll MOK。画面は数秒で閉じ、閉じると登録されない。
-- `MOK_STATE` が `unreadable` なのは一般ユーザーで実行したため。判定に影響しないことが多いが、Secure Boot が疑わしいときは `--sudo` 付きでの再実行を頼む。
+- `MOK_STATE` が `unreadable` なのは一般ユーザーで実行したため。判定に影響しないことが多いが、Secure Boot が疑わしいときは、sudo 認証が利用できるデスクトップのターミナルで `--no-sudo` を外して再実行を頼む。既定の sudo 認証が失敗していないかも確認する。
 - Secure Boot を無効にする案は最後の手段としてのみ挙げる。
 
 ### カーネルログ

@@ -5,8 +5,9 @@
 # (パッケージ導入・設定変更・モジュール読み込み・再起動はしない)。
 #
 # 使い方 (デスクトップのターミナルから一般ユーザーで実行):
-#   ./dump-nvidia-ubuntu-diagnosis.sh                 診断して判定を表示し、レポートを保存する
-#   ./dump-nvidia-ubuntu-diagnosis.sh --sudo          MOK 鍵の登録状況など、権限が要る確認も行う (読み取りのみ)
+#   ./dump-nvidia-ubuntu-diagnosis.sh                 説明後に sudo 認証し、診断してレポートを保存する
+#   ./dump-nvidia-ubuntu-diagnosis.sh --no-sudo       sudo を使わず、一般ユーザーで読める範囲だけ確認する
+#   ./dump-nvidia-ubuntu-diagnosis.sh --sudo          権限が要る読み取りも行う (既定。互換用)
 #   ./dump-nvidia-ubuntu-diagnosis.sh --redact        レポート中のホスト名・ユーザー名・GPU シリアル等を伏せる
 #   ./dump-nvidia-ubuntu-diagnosis.sh --attach FILE   任意のファイル (chrome://gpu のコピーなど) をレポートに添付
 #   ./dump-nvidia-ubuntu-diagnosis.sh -o FILE         レポートの保存先 (既定: ./nvidia-ubuntu-report-日時.txt)
@@ -58,18 +59,52 @@ run() {
 # ================================================================ 準備
 
 parse_args() {
-  OUT="" REDACT=0 COLOR=auto USE_SUDO=0 ATTACH=()
+  OUT="" REDACT=0 COLOR=auto USE_SUDO=1 ATTACH=()
   while (( $# )); do
     case $1 in
       -o|--output) (( $# >= 2 )) || die "-o にはファイル名が必要"; OUT=$2; shift 2 ;;
       --attach)    (( $# >= 2 )) || die "--attach にはファイル名が必要"; ATTACH+=("$2"); shift 2 ;;
       --redact)    REDACT=1; shift ;;
       --sudo)      USE_SUDO=1; shift ;;
+      --no-sudo)   USE_SUDO=0; shift ;;
       --no-color)  COLOR=never; shift ;;
       -h|--help)   usage; exit 0 ;;
       *)           usage >&2; die "不明なオプション: $1" ;;
     esac
   done
+}
+
+# 認証前に読み取りの範囲を説明する。非対話実行ではパスワードを待たない。
+setup_sudo() {
+  SUDO=""
+  if (( ! USE_SUDO || EUID == 0 )); then return 0; fi
+  cat >&2 <<'NOTICE'
+この診断は、権限が必要な情報の読み取りに sudo を使います。
+  対象: GRUB の起動設定、カーネルログ、DKMS のビルドログ、Secure Boot の MOK 証明書・登録状況など。
+  パッケージの導入・削除、設定変更、モジュールの明示的な読み込み、再起動は行いません。
+  sudo でスクリプト全体を起動せず、描画や Chrome の確認はログイン中の一般ユーザーで行います。
+  書き込むのはレポートと一時ファイルです。診断ツールによるキャッシュ・ログや sudo の認証記録は発生し得ます。
+  認証できない場合は、一般ユーザーで読める範囲の診断を続けます。
+  sudo を使いたくない場合は、--no-sudo を付けて実行してください。
+これから sudo の認証を確認します。必要に応じてパスワード入力を求められます。
+NOTICE
+  if ! have sudo; then
+    echo "sudo がないため、一般ユーザーで読める範囲の診断を続けます。" >&2
+    note "権限が必要な読み取り: sudo コマンドなし"
+    return 0
+  fi
+  local rc
+  if [[ -t 0 || -t 2 ]]; then
+    sudo -v; rc=$?
+  else
+    sudo -n -v; rc=$?
+  fi
+  if (( rc == 0 )); then
+    SUDO="sudo -n"
+  else
+    echo "sudo 認証を利用できないため、一般ユーザーで読める範囲の診断を続けます。" >&2
+    note "権限が必要な読み取り: sudo 認証を利用できない (終了コード $rc)"
+  fi
 }
 
 setup() {
@@ -78,11 +113,7 @@ setup() {
   WORK=$(mktemp -d "${TMPDIR:-/tmp}/nvidia-ubuntu-report.XXXXXX") || die "一時ディレクトリを作れない"
   trap 'rm -rf "$WORK"' EXIT
   RAW="$WORK/raw.txt"; : >"$RAW"
-  SUDO=""
-  if (( USE_SUDO && EUID != 0 )); then
-    echo "権限が必要な確認に sudo を使います (読み取りのみ)。" >&2
-    if sudo -v; then SUDO="sudo -n"; else echo "sudo を使えないため、その確認は省略します。" >&2; fi
-  fi
+  setup_sudo
   if [[ $COLOR == auto && -t 1 ]]; then
     C_FAIL=$'\e[1;31m' C_WARN=$'\e[1;33m' C_INFO=$'\e[36m' C_OK=$'\e[32m' C_B=$'\e[1m' C_0=$'\e[0m'
   else
@@ -690,7 +721,7 @@ $how sudo mokutil --import $MOK_CERT (一時パスワードを決める) → 再
           finding OK "Secure Boot: 有効、現在のモジュールは問題なく読み込めている"
         else
           finding INFO "Secure Boot: 有効、DKMS の署名鍵の登録状況は未確認" "確認結果: $MOK_STATE。実際のモジュール署名者と設定上の証明書の対応は未確認。
-→ 必要なら --sudo を付けて実行すると確認できる (未登録や鍵の欠落だけでは、実際の読み込み拒否の原因とは断定できない)"
+→ sudo 認証が利用できるデスクトップのターミナルで再実行すると確認できる (未登録や鍵の欠落だけでは、実際の読み込み拒否の原因とは断定できない)"
         fi
       elif [[ -n $DISK_VER ]]; then
         finding INFO "Secure Boot: 有効、ディスク上のモジュールに署名あり" "署名者: $DISK_SIGNER。署名の存在だけでは、このマシンで信頼される鍵かは判断できない。"
@@ -738,7 +769,7 @@ check_kernel_log() {
   sec "カーネルログ (今回の起動、NVIDIA 関連)"
   if [[ -z $KLOG_SRC ]]; then
     note "(読めなかった)"
-    finding INFO "カーネルログを読めない" "→ adm グループに入っているユーザーで実行するか、--sudo を付けて実行"
+    finding INFO "カーネルログを読めない" "→ adm グループに入っているユーザーで実行するか、sudo 認証が利用できるターミナルで --no-sudo を外して再実行"
   else
     note "取得元: $KLOG_SRC"
     printf '%s\n' "$NVLOG" | headtail 60 160 >>"$RAW"
@@ -1247,7 +1278,7 @@ TOOLS
 
 collect_raw_system() {
   sec "システム"
-  note "nvidia-ubuntu-report / $NOW / 実行ユーザー: $(id -un) (EUID $EUID)${SUDO:+ / --sudo 使用}"
+  note "nvidia-ubuntu-report / $NOW / 実行ユーザー: $(id -un) (EUID $EUID)${SUDO:+ / sudo による読み取りあり}"
   run "grep -E '^(PRETTY_NAME|VERSION_ID)=' /etc/os-release"
   run "uname -a"
   run "uptime"
@@ -1266,7 +1297,7 @@ collect_raw_system() {
   run "${SUDO:+$SUDO }grep -E '^(saved_entry|next_entry)=' /boot/grub/grubenv"
   run "dpkg-query -W -f='\${db:Status-Abbrev} \${Package} \${Version}\n' 'linux-image-*' 'linux-headers-*' 'linux-oem-*' 'linux-generic*' 2>/dev/null | grep -vE '^(un|pn)'"
   if (( EUID == 0 )); then
-    finding INFO "root で実行された" "OpenGL や Chrome の確認はログイン中のユーザーの環境でないと正確でない。一般ユーザーで実行し、権限が要る確認は --sudo を使う。"
+    finding INFO "root で実行された" "OpenGL や Chrome の確認はログイン中のユーザーの環境でないと正確でない。一般ユーザーで実行し、権限が要る読み取りには既定で sudo を使う。"
   fi
 }
 

@@ -14,7 +14,7 @@ Ubuntu 24.04 + NVIDIA GPU のマシンでは、ドライバやカーネルの更
 ## 守ること
 
 1. **`dump-nvidia-ubuntu-diagnosis.sh` は読み取り専用に保つ。** パッケージの導入、設定の変更、モジュールの読み込み、再起動など、システムを変える処理を入れない。書き込んでよいのは、レポートのファイルと `mktemp` の一時ディレクトリだけ。対処はコマンドを「表示する」だけにする。
-2. **ユーザーのマシンでシステムを変えるコマンドを実行しない。** `sudo`、`apt`、`modprobe`、`mokutil --import`、`update-grub`、`dkms` などは、必要ならユーザーに提示して実行してもらう。`./dump-nvidia-ubuntu-diagnosis.sh` (`--sudo` なし) は読み取りだけなので実行してよい。ただし、出たレポートはコミットしない (ホスト名などを含む。`.gitignore` で `nvidia-ubuntu-report-*.txt` を除外済み)。
+2. **ユーザーのマシンでシステムを変えるコマンドを実行しない。** `sudo`、`apt`、`modprobe`、`mokutil --import`、`update-grub`、`dkms` などは、必要ならユーザーに提示して実行してもらう。`./dump-nvidia-ubuntu-diagnosis.sh --no-sudo` は読み取りだけなので実行してよい。ただし、出たレポートはコミットしない (ホスト名などを含む。`.gitignore` で `nvidia-ubuntu-report-*.txt` を除外済み)。
 3. **終了コードの約束を変えない。** 0 = 問題なし、1 = WARN あり、2 = FAIL あり。
 4. **Ubuntu 24.04 の標準環境で動くこと。** bash 5.2、awk は **mawk** (gawk 専用の機能は使わない: `gensub`、`strftime`、`asort`、配列の配列など)、GNU の coreutils / sed / grep。Python は `chrome_local_state` で使っているだけで、なくても動く。
 5. 表示、レポート、コード内のコメントは日本語。コミットメッセージは英語。
@@ -53,7 +53,7 @@ Ubuntu 24.04 + NVIDIA GPU のマシンでは、ドライバやカーネルの更
 - BODY は説明のあとに `→ ` で始まる対処の行を置く。対処は実行できる具体的なコマンドで書く。
 - 対処の文面を作る関数: `module_fix_hint` (カーネル用モジュールの用意)、`boot_other_kernel_hint` (動くカーネルで起動する手順)、`sb_issue_text` / `sb_reboot_note` (Secure Boot)。
 
-`run "コマンド" [行数]` はコマンド行と出力を生データに記録する (40 秒でタイムアウト、出力は既定で先頭 200 行)。`--sudo` のときは `SUDO="sudo -n"` を権限の要る読み取りの前に付けている。
+`run "コマンド" [行数]` はコマンド行と出力を生データに記録する (40 秒でタイムアウト、出力は既定で先頭 200 行)。既定では `setup_sudo` が説明を表示してから認証を確認し、成功した場合だけ `SUDO="sudo -n"` を権限の要る読み取りの前に付ける。スクリプト全体は一般ユーザーで動かす。`--no-sudo` は sudo を呼ばず、`--sudo` は互換用。非対話実行では `sudo -n -v` を使い、認証不可・sudo 不在なら一般ユーザーで読める範囲を続ける。エージェントによる検証では sudo を実行せず、必要ならモックで経路を確認する。
 
 新しい故障パターンに対応するときの手順:
 
