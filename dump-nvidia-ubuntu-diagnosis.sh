@@ -5,7 +5,7 @@
 # (パッケージ導入・設定変更・モジュール読み込み・再起動はしない)。
 #
 # 使い方 (デスクトップのターミナルから一般ユーザーで実行):
-#   ./dump-nvidia-ubuntu-diagnosis.sh                 説明後に sudo 認証し、診断してレポートを保存する
+#   ./dump-nvidia-ubuntu-diagnosis.sh                 通常の確認後、説明・sudo 認証を経て追加確認し、レポートを保存する
 #   ./dump-nvidia-ubuntu-diagnosis.sh --no-sudo       sudo を使わず、一般ユーザーで読める範囲だけ確認する
 #   ./dump-nvidia-ubuntu-diagnosis.sh --sudo          権限が要る読み取りも行う (既定。互換用)
 #   ./dump-nvidia-ubuntu-diagnosis.sh --redact        レポート中のホスト名・ユーザー名・GPU シリアル等を伏せる
@@ -50,10 +50,28 @@ headtail() {
 run() {
   local cmd=$1 limit=${2:-200} t="$WORK/run.out" rc
   printf '$ %s\n' "$cmd" >>"$RAW"
+  [[ $cmd == sudo\ * ]] && printf '$ %s\n' "$cmd" >&"$COMMAND_FD"
   timeout 40 bash -c "$cmd" >"$t" 2>&1; rc=$?
   headtail "$limit" 0 <"$t" >>"$RAW"
   if (( rc == 124 )); then note '[timeout]'; elif (( rc != 0 )); then note "[exit $rc]"; fi
   note ''
+}
+
+# リダイレクトやコマンド置換でも、実行前の表示は呼び出し元の端末へ出す。
+announce_command() {
+  local display
+  printf -v display '%q ' "$@"
+  printf '$ %s\n' "${display% }" >&"$COMMAND_FD"
+  note "$ ${display% }"
+}
+
+read_privileged() {
+  if [[ -n $SUDO ]]; then
+    announce_command sudo -n "$@"
+    timeout 40 sudo -n "$@"
+  else
+    "$@"
+  fi
 }
 
 # ================================================================ 準備
@@ -79,7 +97,7 @@ setup_sudo() {
   SUDO=""
   if (( ! USE_SUDO || EUID == 0 )); then return 0; fi
   cat >&2 <<'NOTICE'
-この診断は、権限が必要な情報の読み取りに sudo を使います。
+通常権限での確認が終わりました。続いて、権限が必要な情報の読み取りに sudo を使います。
   対象: GRUB の起動設定、カーネルログ、DKMS のビルドログ、Secure Boot の MOK 証明書・登録状況など。
   パッケージの導入・削除、設定変更、モジュールの明示的な読み込み、再起動は行いません。
   sudo でスクリプト全体を起動せず、描画や Chrome の確認はログイン中の一般ユーザーで行います。
@@ -95,8 +113,10 @@ NOTICE
   fi
   local rc
   if [[ -t 0 || -t 2 ]]; then
+    announce_command sudo -v
     sudo -v; rc=$?
   else
+    announce_command sudo -n -v
     sudo -n -v; rc=$?
   fi
   if (( rc == 0 )); then
@@ -113,7 +133,8 @@ setup() {
   WORK=$(mktemp -d "${TMPDIR:-/tmp}/nvidia-ubuntu-report.XXXXXX") || die "一時ディレクトリを作れない"
   trap 'rm -rf "$WORK"' EXIT
   RAW="$WORK/raw.txt"; : >"$RAW"
-  setup_sudo
+  SUDO=""
+  exec {COMMAND_FD}>&2
   if [[ $COLOR == auto && -t 1 ]]; then
     C_FAIL=$'\e[1;31m' C_WARN=$'\e[1;33m' C_INFO=$'\e[36m' C_OK=$'\e[32m' C_B=$'\e[1m' C_0=$'\e[0m'
   else
@@ -338,26 +359,7 @@ collect_facts() {
   KERNELS=()
   for f in /boot/vmlinuz-*; do [[ -f $f ]] && KERNELS+=("${f#/boot/vmlinuz-}"); done
   if (( ${#KERNELS[@]} )); then mapfile -t KERNELS < <(printf '%s\n' "${KERNELS[@]}" | sort -V); fi
-  NEXT_KERNEL="" NEXT_HOW=""
-  local gd se=""
-  gd=$(grep -hE '^[[:space:]]*GRUB_DEFAULT=' /etc/default/grub /etc/default/grub.d/*.cfg 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d "\"' ")
-  local grub_env
-  grub_env=$($SUDO cat /boot/grub/grubenv 2>/dev/null)
-  se=$(sed -n 's/^next_entry=//p' <<<"$grub_env")
-  [[ -z $se && $gd == saved ]] && se=$(sed -n 's/^saved_entry=//p' <<<"$grub_env")
-  local entry=${se:-${gd:-0}} grub_config="$WORK/grub.cfg" candidate=""
-  # --sudo でも読み取りだけを行い、取得した設定は一時ディレクトリに置く。
-  if $SUDO cat /boot/grub/grub.cfg >"$grub_config" 2>/dev/null; then
-    if [[ $entry != saved ]]; then
-      candidate=$(grub_entry_kernel "$entry" "$grub_config")
-      for k in "${KERNELS[@]}"; do
-        [[ $k == "$candidate" ]] && NEXT_KERNEL=$k
-      done
-    fi
-    NEXT_HOW="生成済み grub.cfg、選択指定: $entry"
-  else
-    NEXT_HOW="grub.cfg を読めない、選択指定: $entry"
-  fi
+  collect_boot_facts
 
   # カーネルごとの nvidia モジュールの版と、ライブラリと版が合うカーネル
   declare -gA KMOD_VER=()
@@ -386,25 +388,7 @@ collect_facts() {
   MOK_CERT=/var/lib/shim-signed/mok/MOK.der
   local c; c=$(grep -hE '^[[:space:]]*mok_certificate=' /etc/dkms/framework.conf /etc/dkms/framework.conf.d/*.conf 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d "\"' ")
   [[ -n $c ]] && MOK_CERT=$c
-  MOK_STATE=unknown MOK_PENDING=0
-  if have mokutil && [[ $SB_ON == 1 ]]; then
-    local t
-    if $SUDO test -e "$MOK_CERT" 2>/dev/null; then
-      t=$($SUDO mokutil --test-key "$MOK_CERT" 2>&1)
-      case $t in
-        *"already enrolled"*)   MOK_STATE=enrolled ;;
-        *"enrollment request"*) MOK_STATE=pending ;;
-        *"not enrolled"*)       MOK_STATE=not-enrolled ;;
-        *)                      MOK_STATE="unknown ($(head -n1 <<<"$t"))" ;;
-      esac
-    elif [[ -n $SUDO || -x ${MOK_CERT%/*} ]]; then
-      MOK_STATE=no-key
-    else
-      MOK_STATE=unreadable
-    fi
-    [[ $($SUDO mokutil --list-new 2>&1) == *"[key"* ]] && MOK_PENDING=1
-    [[ $MOK_STATE == not-enrolled && $MOK_PENDING == 1 ]] && MOK_STATE=pending
-  fi
+  collect_mok_facts
 
   # --- モジュールの読み込みを妨げる設定
   NOUVEAU_LOADED=0; [[ -d /sys/module/nouveau ]] && NOUVEAU_LOADED=1
@@ -422,31 +406,91 @@ collect_facts() {
   PRIME_MODE=""; have prime-select && PRIME_MODE=$(timeout 10 prime-select query 2>/dev/null | head -n1)
   MODESET=$(cat /sys/module/nvidia_drm/parameters/modeset 2>/dev/null)
 
+  collect_log_facts
+
+  derive_secureboot_issue
+
+  CORE_STATE=unknown
+}
+
+# 通常権限で一度読み、最後の認証後に必要な情報だけ再取得する。
+collect_boot_facts() {
+  local k
+  NEXT_KERNEL="" NEXT_HOW=""
+  local gd se=""
+  gd=$(grep -hE '^[[:space:]]*GRUB_DEFAULT=' /etc/default/grub /etc/default/grub.d/*.cfg 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d "\"' ")
+  local grub_env
+  grub_env=$(read_privileged cat /boot/grub/grubenv 2>/dev/null)
+  se=$(sed -n 's/^next_entry=//p' <<<"$grub_env")
+  [[ -z $se && $gd == saved ]] && se=$(sed -n 's/^saved_entry=//p' <<<"$grub_env")
+  local entry=${se:-${gd:-0}} grub_config="$WORK/grub.cfg" candidate=""
+  # --sudo でも読み取りだけを行い、取得した設定は一時ディレクトリに置く。
+  if read_privileged cat /boot/grub/grub.cfg >"$grub_config" 2>/dev/null; then
+    if [[ $entry != saved ]]; then
+      candidate=$(grub_entry_kernel "$entry" "$grub_config")
+      for k in "${KERNELS[@]}"; do
+        [[ $k == "$candidate" ]] && NEXT_KERNEL=$k
+      done
+    fi
+    NEXT_HOW="生成済み grub.cfg、選択指定: $entry"
+  else
+    NEXT_HOW="grub.cfg を読めない、選択指定: $entry"
+  fi
+
+}
+
+collect_mok_facts() {
+  MOK_STATE=unknown MOK_PENDING=0
+  if have mokutil && [[ $SB_ON == 1 ]]; then
+    local t
+    if read_privileged test -e "$MOK_CERT" 2>/dev/null; then
+      t=$(read_privileged mokutil --test-key "$MOK_CERT" 2>&1)
+      case $t in
+        *"already enrolled"*)   MOK_STATE=enrolled ;;
+        *"enrollment request"*) MOK_STATE=pending ;;
+        *"not enrolled"*)       MOK_STATE=not-enrolled ;;
+        *)                      MOK_STATE="unknown ($(head -n1 <<<"$t"))" ;;
+      esac
+    elif [[ -n $SUDO || -x ${MOK_CERT%/*} ]]; then
+      MOK_STATE=no-key
+    else
+      MOK_STATE=unreadable
+    fi
+    [[ $(read_privileged mokutil --list-new 2>&1) == *"[key"* ]] && MOK_PENDING=1
+    [[ $MOK_STATE == not-enrolled && $MOK_PENDING == 1 ]] && MOK_STATE=pending
+  fi
+
+}
+
+collect_log_facts() {
   # --- ログ
   KLOG="" KLOG_SRC=""
   if have journalctl; then
-    KLOG=$($SUDO journalctl -k -b 0 -q --no-pager -o short-monotonic 2>/dev/null)
+    KLOG=$(read_privileged journalctl -k -b 0 -q --no-pager -o short-monotonic 2>/dev/null)
     [[ -n $KLOG ]] && KLOG_SRC="journalctl -k -b 0"
   fi
   if [[ -z $KLOG ]]; then
-    KLOG=$($SUDO dmesg 2>/dev/null)
+    KLOG=$(read_privileged dmesg 2>/dev/null)
     [[ -n $KLOG ]] && KLOG_SRC=dmesg
   fi
   NVLOG=$(grep -iE 'nvidia|NVRM|nouveau|Xid|module verification|Key was rejected|Lockdown|unsigned module|unavailable key' <<<"$KLOG")
   JLOG_WARN=""
-  have journalctl && JLOG_WARN=$($SUDO journalctl -b 0 -p warning -q --no-pager -o short-monotonic 2>/dev/null | grep -iE 'nvidia|NVRM|nouveau' | tail -n 150)
+  have journalctl && JLOG_WARN=$(read_privileged journalctl -b 0 -p warning -q --no-pager -o short-monotonic 2>/dev/null | grep -iE 'nvidia|NVRM|nouveau' | tail -n 150)
   SIG_REJECT_LINES=$(printf '%s\n%s\n' "$NVLOG" "$JLOG_WARN" | grep -iE 'Key was rejected|Loading of (unsigned module|module with unavailable key) is rejected|Lockdown:.*unsigned module' | sort -u | head -n 5)
 
   # --- DKMS
   MAKELOG=$(ls -t /var/lib/dkms/nvidia/*/build/make.log /var/lib/dkms/nvidia/*/*/*/log/make.log 2>/dev/null | head -n1)
   DKMS_STATUS=""; have dkms && DKMS_STATUS=$(dkms status 2>&1)
   # apt の端末ログに残る DKMS ビルド失敗 (カーネル名の一覧)
-  DKMS_FAILED_KERNELS=$($SUDO tail -n 20000 /var/log/apt/term.log 2>/dev/null |
+  DKMS_FAILED_KERNELS=$(read_privileged tail -n 20000 /var/log/apt/term.log 2>/dev/null |
     sed -nE 's/.*Bad return status for module build on kernel: ([^ ]+).*/\1/p' | sort -u)
   MAKELOG_ERRORS=""
-  [[ -n $MAKELOG ]] && MAKELOG_ERRORS=$($SUDO grep -m5 -E 'error:|Error [0-9]+|\*\*\*' "$MAKELOG" 2>/dev/null)
+  [[ -n $MAKELOG ]] && MAKELOG_ERRORS=$(read_privileged grep -m5 -E 'error:|Error [0-9]+|\*\*\*' "$MAKELOG" 2>/dev/null)
   NEXT_BAD=0
 
+}
+
+derive_secureboot_issue() {
   # --- Secure Boot が読み込みを妨げているか
   SB_ISSUE=""
   if [[ $SB_ON == 1 ]]; then
@@ -459,7 +503,6 @@ collect_facts() {
     fi
   fi
 
-  CORE_STATE=unknown
 }
 
 # ================================================================ 対処のヒント
@@ -875,9 +918,8 @@ check_userspace() {
     if (( rc == 0 )); then
       finding OK "nvidia-smi: 正常 (${out//$'\n'/; })"
       run "nvidia-smi -q" 150
-      if grep -qF 'PRH failed to update thermal limit!' <<<"$NVLOG"; then
-        run "nvidia-smi -q -d TEMPERATURE,PERFORMANCE,POWER" 200
-      fi
+      # 後で権限付きログから温度制限の記録が見つかる場合に備え、通常権限で先に収集する。
+      run "nvidia-smi -q -d TEMPERATURE,PERFORMANCE,POWER" 200
     elif [[ $out == *mismatch* ]]; then
       [[ $CORE_STATE == reboot || $CORE_STATE == mismatch ]] || finding FAIL "nvidia-smi: Driver/library version mismatch" "$out"
     elif [[ $CORE_STATE != notloaded ]]; then
@@ -1382,19 +1424,17 @@ main() {
   setup
   echo "診断中…" >&2
   collect_facts
+  # CORE_STATE は読み込み中・ディスク上・ライブラリの版で決まる。
+  # 通常権限の描画・Chrome 判定にも必要だが、所見は追加取得後に作り直す。
+  check_core
+  F_LEVEL=() F_TITLE=() F_BODY=()
   collect_raw_system
   collect_tools
-  check_core
-  check_kernels
-  check_dkms
-  check_secureboot
   check_blockers
-  check_kernel_log
   check_firmware
   check_userspace
   check_packages
   check_autoremove
-  check_updates
   check_services
   check_chrome
 
@@ -1403,6 +1443,29 @@ main() {
     sec "添付: $a"
     if [[ -r $a ]]; then headtail 1500 0 <"$a" >>"$RAW"; else note "(読めない)"; fi
   done
+
+  sec "権限が必要な追加確認"
+  setup_sudo
+  if [[ -n $SUDO ]]; then
+    note "sudo による読み取りあり。以下の情報を追加取得して最終判定する。"
+    collect_boot_facts
+    collect_mok_facts
+    collect_log_facts
+    derive_secureboot_issue
+  else
+    note "sudo による追加取得なし。通常権限で取得できた情報から最終判定する。"
+  fi
+
+  # 最終的な根本原因の所見を、先に収集した描画などの所見より前に置く。
+  local early_level=("${F_LEVEL[@]}") early_title=("${F_TITLE[@]}") early_body=("${F_BODY[@]}")
+  F_LEVEL=() F_TITLE=() F_BODY=()
+  check_core
+  check_kernels
+  check_dkms
+  check_secureboot
+  check_kernel_log
+  F_LEVEL+=("${early_level[@]}") F_TITLE+=("${early_title[@]}") F_BODY+=("${early_body[@]}")
+  check_updates
 
   write_report
   render_summary color

@@ -38,8 +38,8 @@ Ubuntu 24.04 + NVIDIA GPU のマシンでは、ドライバやカーネルの更
    - パッケージ: `PKG_NV` / `PKG_NV_INST` / `PKG_CORE_VERS` / `PKG_BROKEN` / `PKG_HELD`
 
    関数内には順序の依存がある (例: `GOOD_KERNELS` は `USER_VER` のあとに求める)。
-2. `collect_raw_system`: レポートの生データの先頭部分。
-3. `check_*`: 順に実行し、生データを `sec` / `note` / `run` で記録し、所見を `finding LEVEL TITLE BODY` で追加する。
+2. `collect_raw_system` / `collect_tools` と通常権限の `check_*`: システム・ツール・描画・パッケージ・自動削除シミュレーション・サービス・Chrome を先に収集する。描画・Chrome 判定用に `check_core` を一度実行するが、その暫定所見は捨てる。
+3. 最後に `setup_sudo` で説明・認証を行い、成功した場合だけ `collect_boot_facts` / `collect_mok_facts` / `collect_log_facts` と `derive_secureboot_issue` で権限が必要な情報を更新する。「権限が必要な追加確認」節以降が追加取得と最終判定。`check_core` / `check_kernels` / `check_dkms` / `check_secureboot` / `check_kernel_log` は最終情報で実行し、所見を通常権限の確認結果より前に置く。`check_updates` は更新した `NEXT_BAD` を参照する。生データを `sec` / `note` / `run` で記録し、所見を `finding LEVEL TITLE BODY` で追加する。
    - `check_core` が `CORE_STATE` (`ok` / `nogpu` / `nodriver` / `reboot` / `mismatch` / `nolib` / `notloaded`) を決め、後の関数はこれを見て重複する所見を出さない (例: 再起動待ちのとき nvidia-smi の mismatch は所見にしない)。
    - `check_kernels` が `NEXT_BAD` を決め、`check_updates` が再起動を勧めるかどうかに使う。
    - `check_autoremove` は `check_packages` の後に `apt-get --simulate autoremove` を実行し、「自動削除のシミュレーション」節に出力全体と終了コードを記録する。実際の削除はしない。移行先が導入済みで削除予定にない移行用 NVIDIA パッケージは INFO、追加照合が必要な GPU / カーネル関連候補は WARN、その他の用途の候補は INFO とする。
@@ -53,7 +53,7 @@ Ubuntu 24.04 + NVIDIA GPU のマシンでは、ドライバやカーネルの更
 - BODY は説明のあとに `→ ` で始まる対処の行を置く。対処は実行できる具体的なコマンドで書く。
 - 対処の文面を作る関数: `module_fix_hint` (カーネル用モジュールの用意)、`boot_other_kernel_hint` (動くカーネルで起動する手順)、`sb_issue_text` / `sb_reboot_note` (Secure Boot)。
 
-`run "コマンド" [行数]` はコマンド行と出力を生データに記録する (40 秒でタイムアウト、出力は既定で先頭 200 行)。既定では `setup_sudo` が説明を表示してから認証を確認し、成功した場合だけ `SUDO="sudo -n"` を権限の要る読み取りの前に付ける。スクリプト全体は一般ユーザーで動かす。`--no-sudo` は sudo を呼ばず、`--sudo` は互換用。非対話実行では `sudo -n -v` を使い、認証不可・sudo 不在なら一般ユーザーで読める範囲を続ける。エージェントによる検証では sudo を実行せず、必要ならモックで経路を確認する。
+`run "コマンド" [行数]` はコマンド行と出力を生データに記録する (40 秒でタイムアウト、出力は既定で先頭 200 行)。通常権限での確認を済ませた後、既定では `setup_sudo` が説明を表示してから認証を確認し、成功した場合だけ `SUDO="sudo -n"` を権限の要る読み取りの前に付ける。スクリプト全体は一般ユーザーで動かす。`--no-sudo` は sudo を呼ばず、`--sudo` は互換用。非対話実行では `sudo -n -v` を使い、認証不可・sudo 不在なら一般ユーザーで読める範囲を続ける。`announce_command` は実行前の sudo コマンドを、リダイレクトやコマンド置換でも消えない表示用 FD と生データへ出す。直接読み取りは `read_privileged`、シェル文字列の読み取りは `run` を通し、sudo の未表示実行を追加しない。エージェントによる検証では sudo を実行せず、必要ならモックで経路を確認する。
 
 新しい故障パターンに対応するときの手順:
 
