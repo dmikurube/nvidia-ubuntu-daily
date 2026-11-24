@@ -92,6 +92,43 @@ parse_args() {
   done
 }
 
+# 認証前の一覧。引数は実行せず、空白などをシェルの引用表記で示す。
+preview_sudo_command() {
+  local display
+  printf -v display '%q ' sudo -n "$@"
+  printf '  $ %s\n' "${display% }" >&"$COMMAND_FD"
+  note "実行候補: ${display% }"
+}
+
+show_sudo_plan() {
+  printf '%s\n' '認証後に sudo で実行する読み取りコマンドの一覧です。' '条件によって省略するものや、複数回実行するものも含みます。出力の抽出・整形は通常権限で行います。' >&"$COMMAND_FD"
+  preview_sudo_command cat /boot/grub/grubenv
+  preview_sudo_command cat /boot/grub/grub.cfg
+  if have mokutil && [[ $SB_ON == 1 ]]; then
+    preview_sudo_command test -e "$MOK_CERT"
+    preview_sudo_command mokutil --test-key "$MOK_CERT"
+    preview_sudo_command mokutil --list-new
+    preview_sudo_command mokutil --list-enrolled
+  fi
+  if have journalctl; then
+    preview_sudo_command journalctl -k -b 0 -q --no-pager -o short-monotonic
+    preview_sudo_command journalctl -b 0 -p warning -q --no-pager -o short-monotonic
+  fi
+  preview_sudo_command dmesg
+  preview_sudo_command tail -n 20000 /var/log/apt/term.log
+  if [[ -n $MAKELOG ]]; then
+    preview_sudo_command grep -m5 -E 'error:|Error [0-9]+|\*\*\*' "$MAKELOG"
+  fi
+  if have dkms; then
+    preview_sudo_command tail -n 4000 /var/log/apt/term.log
+    if [[ -n $DKMS_PKG && -n $MAKELOG ]]; then
+      preview_sudo_command tail -n 60 "$MAKELOG"
+    fi
+  fi
+  preview_sudo_command journalctl -k -b -1 -q --no-pager -o short-monotonic
+  printf '%s\n' 'この一覧を確認してから、続く sudo の認証要求に応じてください。中止する場合は Ctrl+C を押してください。' >&"$COMMAND_FD"
+}
+
 # 認証前に読み取りの範囲を説明する。非対話実行ではパスワードを待たない。
 setup_sudo() {
   SUDO=""
@@ -104,13 +141,14 @@ setup_sudo() {
   書き込むのはレポートと一時ファイルです。診断ツールによるキャッシュ・ログや sudo の認証記録は発生し得ます。
   認証できない場合は、一般ユーザーで読める範囲の診断を続けます。
   sudo を使いたくない場合は、--no-sudo を付けて実行してください。
-これから sudo の認証を確認します。必要に応じてパスワード入力を求められます。
 NOTICE
   if ! have sudo; then
     echo "sudo がないため、一般ユーザーで読める範囲の診断を続けます。" >&2
     note "権限が必要な読み取り: sudo コマンドなし"
     return 0
   fi
+  show_sudo_plan
+  echo "これから sudo の認証を確認します。必要に応じてパスワード入力を求められます。" >&2
   local rc
   if [[ -t 0 || -t 2 ]]; then
     announce_command sudo -v
@@ -479,8 +517,11 @@ collect_log_facts() {
   SIG_REJECT_LINES=$(printf '%s\n%s\n' "$NVLOG" "$JLOG_WARN" | grep -iE 'Key was rejected|Loading of (unsigned module|module with unavailable key) is rejected|Lockdown:.*unsigned module' | sort -u | head -n 5)
 
   # --- DKMS
-  MAKELOG=$(ls -t /var/lib/dkms/nvidia/*/build/make.log /var/lib/dkms/nvidia/*/*/*/log/make.log 2>/dev/null | head -n1)
-  DKMS_STATUS=""; have dkms && DKMS_STATUS=$(dkms status 2>&1)
+  # 認証前に表示したログパスを、認証後に別のパスへ差し替えない。
+  if [[ -z $SUDO ]]; then
+    MAKELOG=$(ls -t /var/lib/dkms/nvidia/*/build/make.log /var/lib/dkms/nvidia/*/*/*/log/make.log 2>/dev/null | head -n1)
+    DKMS_STATUS=""; have dkms && DKMS_STATUS=$(dkms status 2>&1)
+  fi
   # apt の端末ログに残る DKMS ビルド失敗 (カーネル名の一覧)
   DKMS_FAILED_KERNELS=$(read_privileged tail -n 20000 /var/log/apt/term.log 2>/dev/null |
     sed -nE 's/.*Bad return status for module build on kernel: ([^ ]+).*/\1/p' | sort -u)
