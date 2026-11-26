@@ -279,9 +279,11 @@ select_driver_packages() {
 
 # 生成済み設定を実行せず、標準の menuentry ID と linux 行を照合する。
 # 複数の候補・動的なパス・未対応の指定は空欄として残す。
+# サブメニューの階層指定 (submenu の ID>menuentry の ID) は末尾の ID で照合する。
+# GRUB の Advanced options から選ぶと GRUB_SAVEDEFAULT でこの形で保存される。
+# 番号やタイトルによる階層指定は照合できず空欄になる。
 grub_entry_kernel() {
   local entry=$1 config=$2
-  [[ $entry == *'>'* ]] && return 0  # サブメニューの階層指定は未対応
   awk -v wanted="$entry" '
     BEGIN { n=split(wanted, parts, ">"); id=parts[n]; active=0; entries=0; kernels=0 }
     /^[[:space:]]*(menuentry|submenu)[[:space:]]/ {
