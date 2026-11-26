@@ -70,7 +70,7 @@ read_privileged() {
     announce_command sudo -n "$@"
     timeout 40 sudo -n "$@"
   else
-    "$@"
+    timeout 40 "$@"
   fi
 }
 
@@ -113,6 +113,8 @@ show_sudo_plan() {
   if have journalctl; then
     preview_sudo_command journalctl -k -b 0 -q --no-pager -o short-monotonic
     preview_sudo_command journalctl -b 0 -p warning -q --no-pager -o short-monotonic
+    preview_sudo_command journalctl --list-boots -q --no-pager
+    preview_sudo_command journalctl -q --no-pager -o cat _TRANSPORT=kernel -g '^Linux version '
   fi
   preview_sudo_command dmesg
   preview_sudo_command tail -n 20000 /var/log/apt/term.log
@@ -401,11 +403,12 @@ collect_facts() {
   if (( ${#KERNELS[@]} )); then mapfile -t KERNELS < <(printf '%s\n' "${KERNELS[@]}" | sort -V); fi
   collect_boot_facts
 
-  # カーネルごとの nvidia モジュールの版と、ライブラリと版が合うカーネル
-  declare -gA KMOD_VER=()
+  # カーネルごとの nvidia モジュールの版・ファイルと、ライブラリと版が合うカーネル
+  declare -gA KMOD_VER=() KMOD_FILE=()
   GOOD_KERNELS=()
   for k in "${KERNELS[@]}"; do
     KMOD_VER[$k]=$(modinfo -k "$k" -F version nvidia 2>/dev/null | head -n1)
+    KMOD_FILE[$k]=$(modinfo -k "$k" -F filename nvidia 2>/dev/null | head -n1)
     [[ -n ${KMOD_VER[$k]} && ( -z $USER_VER || ${KMOD_VER[$k]} == "$USER_VER" ) ]] && GOOD_KERNELS+=("$k")
   done
 
@@ -456,7 +459,7 @@ collect_facts() {
 # 通常権限で一度読み、最後の認証後に必要な情報だけ再取得する。
 collect_boot_facts() {
   local k
-  NEXT_KERNEL="" NEXT_HOW=""
+  NEXT_KERNEL="" NEXT_HOW="" NEXT_ENTRY=""
   local gd se=""
   gd=$(grep -hE '^[[:space:]]*GRUB_DEFAULT=' /etc/default/grub /etc/default/grub.d/*.cfg 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d "\"' ")
   local grub_env
@@ -464,6 +467,7 @@ collect_boot_facts() {
   se=$(sed -n 's/^next_entry=//p' <<<"$grub_env")
   [[ -z $se && $gd == saved ]] && se=$(sed -n 's/^saved_entry=//p' <<<"$grub_env")
   local entry=${se:-${gd:-0}} grub_config="$WORK/grub.cfg" candidate=""
+  NEXT_ENTRY=$entry
   # --sudo でも読み取りだけを行い、取得した設定は一時ディレクトリに置く。
   if read_privileged cat /boot/grub/grub.cfg >"$grub_config" 2>/dev/null; then
     if [[ $entry != saved ]]; then
@@ -517,6 +521,15 @@ collect_log_facts() {
   JLOG_WARN=""
   have journalctl && JLOG_WARN=$(read_privileged journalctl -b 0 -p warning -q --no-pager -o short-monotonic 2>/dev/null | grep -iE 'nvidia|NVRM|nouveau' | tail -n 150)
   SIG_REJECT_LINES=$(printf '%s\n%s\n' "$NVLOG" "$JLOG_WARN" | grep -iE 'Key was rejected|Loading of (unsigned module|module with unavailable key) is rejected|Lockdown:.*unsigned module' | sort -u | head -n 5)
+
+  # --- ジャーナルに記録された起動とカーネル
+  # ルートの解錠前に止まった起動はジャーナルに残らないため、ここにあるのは起動に成功したものだけ。
+  BOOT_COUNT=0 BOOTED_KERNELS=""
+  if have journalctl; then
+    BOOT_COUNT=$(read_privileged journalctl --list-boots -q --no-pager 2>/dev/null | grep -cE '^[[:space:]]*-?[0-9]+[[:space:]]')
+    BOOTED_KERNELS=$(read_privileged journalctl -q --no-pager -o cat _TRANSPORT=kernel -g '^Linux version ' 2>/dev/null |
+      awk '$1 == "Linux" && $2 == "version" { print $3 }' | sort -u)
+  fi
 
   # --- DKMS
   # 認証前に表示したログパスを、認証後に別のパスへ差し替えない。
@@ -673,6 +686,16 @@ $(module_fix_hint "$KREL")"
   fi
 }
 
+# モジュールのパスから供給元を表す
+kmod_source() {
+  case $1 in
+    '')               echo なし ;;
+    */updates/dkms/*) echo DKMS ;;
+    */kernel/nvidia*) echo ビルド済み ;;
+    *)                echo その他 ;;
+  esac
+}
+
 check_kernels() {
   sec "インストール済みカーネルと nvidia モジュール"
   note "実行中: $KREL" "次回起動 (推定): ${NEXT_KERNEL:-不明}${NEXT_HOW:+ ($NEXT_HOW)}"
@@ -684,9 +707,19 @@ check_kernels() {
     tag=""
     [[ $k == "$KREL" ]] && tag+=" [実行中]"
     [[ $k == "$NEXT_KERNEL" ]] && tag+=" [次回起動(推定)]"
-    note "$k  ヘッダ:$hdr  nvidia:${v:-なし}$tag"
+    note "$k  ヘッダ:$hdr  nvidia:${v:-なし}  供給元:$(kmod_source "${KMOD_FILE[$k]:-}")$tag"
     if [[ $k != "$KREL" ]] && [[ -z $v || ( -n $USER_VER && $v != "$USER_VER" ) ]]; then no_mod+=("$k:${v:-なし}"); fi
   done
+  note "" "カーネルごとに読み込まれる nvidia.ko (modinfo -k <カーネル> -F filename nvidia):"
+  for k in "${KERNELS[@]}"; do note "  $k  ${KMOD_FILE[$k]:-(なし)}"; done
+  note "" "ジャーナルに記録された起動: $BOOT_COUNT 回 (ルートの解錠前に止まった起動は残らない)" \
+    "起動に成功したことのあるカーネル (ジャーナルの記録範囲):" "$(sed 's/^/  /' <<<"${BOOTED_KERNELS:-(取得できない)}")" ""
+  if [[ -s $WORK/grub.cfg ]]; then
+    note "生成済み grub.cfg の起動エントリ (menuentry / submenu / linux / initrd の行):"
+    grep -E '^[[:space:]]*(menuentry|submenu|linux|linuxefi|initrd|initrdefi)[[:space:]]' "$WORK/grub.cfg" | head -n 40 >>"$RAW"
+    note ""
+  fi
+  run "ls -l /boot"
 
   [[ -n $NV_GPUS ]] || return 0
 
@@ -714,6 +747,16 @@ $(module_fix_hint "$NEXT_KERNEL")"
     fi
   fi
 
+  # ジャーナルが永続化されていない (起動が 1 回分しかない) 場合は判断しない。
+  if [[ -n $NEXT_KERNEL && $NEXT_KERNEL != "$KREL" && -n $BOOTED_KERNELS ]] && (( BOOT_COUNT >= 2 )) &&
+     ! grep -qxF -- "$NEXT_KERNEL" <<<"$BOOTED_KERNELS"; then
+    local why=""
+    [[ $NEXT_ENTRY == 0 || $NEXT_ENTRY == gnulinux-simple-* ]] && why=$'\n'"GRUB の既定がメニュー最上段の項目 ($NEXT_ENTRY) なので、update-grub が走るたびに起動先がその時点の最新のカーネルに変わる。カーネルの導入時ではなく、後の別の更新で切り替わることもある。"
+    finding INFO "次回起動予定 (推定) のカーネル $NEXT_KERNEL は、まだ一度も起動に成功していない" "ジャーナルに残る $BOOT_COUNT 回の起動に、このカーネルの記録がない。次の再起動が、このカーネルでの初めての起動になる。$why
+→ 再起動の前に、initramfs の項目に問題がないことを確認する
+→ 起動しなかったときは、電源を切り、GRUB メニュー (出ないときは起動直後に Esc または Shift) の Advanced options for Ubuntu から $KREL を選ぶ"
+  fi
+
   local others=() e
   for e in "${no_mod[@]}"; do [[ ${e%%:*} == "$NEXT_KERNEL" ]] || others+=("  ${e%%:*}  (nvidia: ${e#*:})"); done
   if (( ${#others[@]} )); then
@@ -736,6 +779,8 @@ check_dkms() {
   fi
   note "\$ dkms status" "$DKMS_STATUS" ""
   run "${SUDO:+$SUDO }tail -n 4000 /var/log/apt/term.log 2>/dev/null | grep -nE 'Error!|Bad return status|Building module.*failed|dkms.*(failed|error)|ERROR \\(dkms' | tail -n 30"
+  # DKMS が組み込んだか、同じ版のビルド済みモジュールがあるため見送ったか
+  run "${SUDO:+$SUDO }tail -n 4000 /var/log/apt/term.log 2>/dev/null | grep -nE 'Building (initial )?module for|Installing to .*/updates/dkms|DKMS will not replace|exactly matches what is already found' | tail -n 30"
   [[ -n $DKMS_PKG ]] || return 0
 
   local nv; nv=$(grep -E '^nvidia[/,]' <<<"$DKMS_STATUS")
@@ -756,6 +801,175 @@ $(module_fix_hint "$KREL")"
   local odd; odd=$(grep -vE ': installed$' <<<"$nv" | grep .)
   [[ -n $odd ]] && finding WARN "DKMS: 完了していないエントリがある" "$odd
 built は「ビルドしたが組み込んでいない」、WARNING 付きは組み込み済みのものと食い違っている状態。"
+  return 0
+}
+
+# 実行中と次回起動で、読み込まれる nvidia モジュールの供給元 (DKMS / ビルド済み) が違わないか。
+# DKMS は、同じ版のビルド済みモジュールが先にあると組み込みを見送るため、
+# パッケージが入った順番によってカーネルごとに供給元が分かれることがある。
+check_module_source() {
+  [[ -n $NV_GPUS ]] || return 0
+  local cur k s nxt="" others=() dv hint
+  cur=$(kmod_source "${KMOD_FILE[$KREL]:-}")
+  [[ $cur == なし ]] && return 0
+  for k in "${KERNELS[@]}"; do
+    [[ $k == "$KREL" || -z ${KMOD_FILE[$k]:-} ]] && continue
+    s=$(kmod_source "${KMOD_FILE[$k]}")
+    [[ $s == "$cur" ]] && continue
+    if [[ $k == "$NEXT_KERNEL" ]]; then nxt=$s; else others+=("  $k  $s (${KMOD_FILE[$k]})"); fi
+  done
+  dv=$(grep -oE '^nvidia/[^,]+' <<<"$DKMS_STATUS" | head -n1)
+  case $cur in
+    DKMS)       hint="→ 実行中と同じ DKMS 版にそろえる: sudo dkms install ${dv:-nvidia/<版>} -k <カーネル> --force" ;;
+    ビルド済み) hint="→ 実行中と同じビルド済み版にそろえる: sudo dkms remove ${dv:-nvidia/<版>} -k <カーネル>   (そのカーネルの updates/dkms の DKMS 版だけを外す)" ;;
+    *)          hint="→ 生データのモジュールのパスと、パッケージの所有関係 (dpkg -S <パス>) を確認する" ;;
+  esac
+  if [[ -n $nxt ]]; then
+    finding WARN "次回起動予定 (推定) のカーネル $NEXT_KERNEL の nvidia モジュールの供給元 ($nxt) が実行中 ($cur) と違う" "実行中 $KREL: ${KMOD_FILE[$KREL]}
+次回起動 $NEXT_KERNEL: ${KMOD_FILE[$NEXT_KERNEL]}
+版が同じでも、ビルドと署名が違うモジュールが読み込まれる。DKMS は、同じ版のビルド済みモジュールが先にあると組み込みを見送る (apt の term.log に DKMS will not replace this module)。どちらが入るかは、パッケージが入った順番で変わることがある。
+今の構成で問題なく動いているなら、次回起動のカーネルも同じ供給元にそろえる。
+${hint//<カーネル>/$NEXT_KERNEL}"
+  fi
+  if (( ${#others[@]} )); then
+    finding INFO "実行中 ($cur) と nvidia モジュールの供給元が違うカーネルが ${#others[@]} 個" "$(printf '%s\n' "${others[@]}")
+GRUB の詳細メニューでこれらを選ぶと、今と別のビルドのモジュールが読み込まれる。普段使わないなら問題ない。
+$hint"
+  fi
+  return 0
+}
+
+# ================================================================ initramfs
+
+INITRD_HOOK=/usr/share/initramfs-tools/hooks/framebuffer-nvidia
+
+# 各カーネルの initramfs の中の NVIDIA GPU ドライバ・GSP ファームウェア・暗号化ルートの部品を調べる。
+# INITRD_STATE[k] = ok / missing / unreadable、INITRD_NV[k] = モジュールのパス、
+# INITRD_GSP[k] = GSP ファームウェアの数、INITRD_CRYPT[k] = 1 / 0、INITRD_SIZE[k] = バイト数
+scan_initrds() {
+  declare -gA INITRD_STATE=() INITRD_NV=() INITRD_GSP=() INITRD_CRYPT=() INITRD_SIZE=()
+  local k f list="$WORK/initrd.list"
+  for k in "${KERNELS[@]}"; do
+    f=/boot/initrd.img-$k
+    if [[ ! -e $f ]]; then INITRD_STATE[$k]=missing; continue; fi
+    INITRD_SIZE[$k]=$(stat -c %s "$f" 2>/dev/null)
+    if [[ ! -r $f ]] || ! have lsinitramfs || ! timeout 90 lsinitramfs "$f" >"$list" 2>/dev/null; then
+      INITRD_STATE[$k]=unreadable; continue
+    fi
+    INITRD_STATE[$k]=ok
+    # hid-nvidia-shield、forcedeth、typec_nvidia などの GPU 以外のドライバは数えない
+    INITRD_NV[$k]=$(grep -E '(^|/)nvidia(-drm|-modeset|-uvm|-peermem)?\.ko(\.(zst|xz|gz))?$' "$list")
+    INITRD_GSP[$k]=$(grep -cE '(^|/)firmware/nvidia/[^/]+/gsp_[^/]*\.bin' "$list")
+    INITRD_CRYPT[$k]=0
+    grep -qE '^cryptroot/crypttab$|(^|/)sbin/cryptsetup$' "$list" && INITRD_CRYPT[$k]=1
+  done
+}
+
+initrd_desc() {   # $1 = カーネル
+  local k=$1 mb n
+  case ${INITRD_STATE[$k]:-} in
+    missing)    echo "/boot/initrd.img-$k なし"; return ;;
+    unreadable) echo "/boot/initrd.img-$k を読めない"; return ;;
+    ok) ;;
+    *)          echo "未確認"; return ;;
+  esac
+  mb=$(awk -v s="${INITRD_SIZE[$k]:-0}" 'BEGIN { printf "%.1fMB", s / 1048576 }')
+  n=$(grep -c . <<<"${INITRD_NV[$k]}")
+  printf '%s  nvidia モジュール %d 個  GSP ファームウェア %d 個  暗号化ルート %s' \
+    "$mb" "$n" "${INITRD_GSP[$k]}" "$([[ ${INITRD_CRYPT[$k]} == 1 ]] && echo あり || echo なし)"
+}
+
+# initramfs に NVIDIA の GPU ドライバが入ると、ルートファイルシステムより前に nvidia-drm が読み込まれる。
+# ルートが LUKS で暗号化されていると、パスフレーズの入力画面が出ないまま止まった事例がある
+# (2026 年 11 月、7.0 系の generic カーネル。framebuffer-nvidia フックが updates/dkms の非圧縮の nvidia*.ko を拾った)。
+check_initramfs() {
+  sec "initramfs と NVIDIA"
+  scan_initrds
+  local k dk divert hook owner
+  divert=$(dpkg-divert --list "$INITRD_HOOK" 2>/dev/null)
+  if [[ -e $INITRD_HOOK ]]; then
+    owner=$(dpkg -S "$INITRD_HOOK" 2>/dev/null | cut -d: -f1)
+    hook="有効 ($INITRD_HOOK${owner:+、パッケージ $owner})"
+  elif [[ -n $divert ]]; then
+    hook="dpkg-divert で退避済み"
+  else
+    hook="なし"
+  fi
+  note "framebuffer-nvidia フック: $hook" "dpkg-divert: ${divert:-(なし)}"
+  [[ -e /etc/initramfs-tools/hooks/framebuffer-nvidia ]] && note "/etc/initramfs-tools/hooks/framebuffer-nvidia: あり"
+  have lsinitramfs || note "(lsinitramfs コマンドなし。initramfs-tools-core に含まれる)"
+  note ""
+  run "grep -hE '^[[:space:]]*(MODULES|FRAMEBUFFER)=' /etc/initramfs-tools/initramfs.conf /etc/initramfs-tools/conf.d/* 2>/dev/null"
+  run "grep -vE '^[[:space:]]*(#|\$)' /etc/initramfs-tools/modules 2>/dev/null"
+  note "カーネルごとの initramfs (lsinitramfs /boot/initrd.img-<カーネル>):"
+  for k in "${KERNELS[@]}"; do
+    local tag=""
+    [[ $k == "$KREL" ]] && tag+=" [実行中]"
+    [[ $k == "$NEXT_KERNEL" ]] && tag+=" [次回起動(推定)]"
+    note "$k  $(initrd_desc "$k")$tag"
+    [[ -n ${INITRD_NV[$k]:-} ]] && sed 's/^/    /' <<<"${INITRD_NV[$k]}" >>"$RAW"
+    dk=$(cd "/lib/modules/$k/updates/dkms" 2>/dev/null && ls -d nvidia*.ko* 2>/dev/null | tr '\n' ' ')
+    [[ -n $dk ]] && note "    updates/dkms: $dk"
+  done
+  note ""
+
+  [[ -n $NV_GPUS ]] || return 0
+
+  # 実行中のカーネルも同じ構成で起動できているなら、このマシンでは問題にならないと見る。
+  if [[ ${INITRD_STATE[$KREL]:-} == ok && -n ${INITRD_NV[$KREL]:-} ]]; then
+    finding INFO "実行中のカーネルの initramfs に NVIDIA ドライバが入っている (この構成で起動できている)" "$KREL: $(initrd_desc "$KREL")
+起動のごく初期に nvidia-drm が読み込まれる構成。今の起動に問題がなければ対処は不要。"
+    return 0
+  fi
+
+  local risky=() others=()
+  for k in "${KERNELS[@]}"; do
+    [[ $k == "$KREL" ]] && continue
+    [[ ${INITRD_STATE[$k]:-} == ok && -n ${INITRD_NV[$k]:-} ]] || continue
+    if [[ -z $NEXT_KERNEL || $k == "$NEXT_KERNEL" ]]; then risky+=("$k"); else others+=("$k"); fi
+  done
+
+  local fix crypt="" title body
+  if (( ${#risky[@]} )); then
+    NEXT_BAD=1
+    for k in "${risky[@]}"; do [[ ${INITRD_CRYPT[$k]} == 1 ]] && crypt=1; done
+    if [[ -e $INITRD_HOOK ]]; then
+      fix="→ フックを hooks ディレクトリの外へ退避する (同じディレクトリ内での改名では実行され続ける。元に戻すときは --add を --remove に):
+  sudo dpkg-divert --local --rename --divert /usr/share/initramfs-tools/framebuffer-nvidia.disabled --add $INITRD_HOOK"
+    else
+      fix="→ initramfs に nvidia を入れている設定を探す: grep -rlE 'nvidia' /usr/share/initramfs-tools/hooks /etc/initramfs-tools"
+    fi
+    for k in "${risky[@]}"; do
+      fix+=$'\n'"→ sudo update-initramfs -u -k $k"
+      fix+=$'\n'"→ 確認: lsinitramfs /boot/initrd.img-$k | grep -E '(^|/)nvidia(-[a-z]+)?\\.ko|gsp_'   (何も出なければよい)"
+    done
+    if [[ -n $NEXT_KERNEL ]]; then
+      title="次回起動予定 (推定) のカーネル $NEXT_KERNEL の initramfs に NVIDIA ドライバが入っている (実行中のカーネルにはない)"
+    else
+      title="initramfs に NVIDIA ドライバが入っているカーネルがある (実行中のカーネルにはない)"
+    fi
+    body=""
+    for k in "${risky[@]}"; do body+="$k: $(initrd_desc "$k")"$'\n'; done
+    body+="実行中 $KREL: $(initrd_desc "$KREL")
+initramfs に入っていると、ルートファイルシステムより前、起動のごく初期に nvidia-drm が読み込まれる。今の起動とは手順が違う。"
+    [[ -n $crypt ]] && body+=$'\n'"ルートが暗号化されている (initramfs に cryptroot がある)。パスフレーズの入力画面より前に nvidia-drm が画面を握るため、入力画面が出ないまま黒い画面で止まった事例がある (2026 年 11 月、7.0 系の generic カーネル)。"
+    [[ -e $INITRD_HOOK ]] && body+=$'\n'"入れているのは $INITRD_HOOK と見られる (updates/dkms の nvidia で始まるモジュールを拾う。595 系では非圧縮の .ko だけが対象で、.ko.zst なら入らない)。"
+    body+=$'\n'"$fix"$'\n'"→ 確かめずに再起動して止まったら、電源を切り、GRUB メニュー (出ないときは起動直後に Esc または Shift) の Advanced options for Ubuntu から $KREL を選ぶ"
+    finding WARN "$title" "$body"
+  elif [[ -n $NEXT_KERNEL && $NEXT_KERNEL != "$KREL" ]]; then
+    case ${INITRD_STATE[$NEXT_KERNEL]:-} in
+      ok)         finding OK "次回起動予定 (推定) のカーネル $NEXT_KERNEL の initramfs に NVIDIA ドライバは入っていない" ;;
+      unreadable) finding INFO "次回起動予定 (推定) のカーネル $NEXT_KERNEL の initramfs を読めない" "→ lsinitramfs /boot/initrd.img-$NEXT_KERNEL | grep -E '(^|/)nvidia(-[a-z]+)?\\.ko|gsp_' で、NVIDIA ドライバが入っていないか確認する" ;;
+      missing)    finding WARN "次回起動予定 (推定) のカーネル $NEXT_KERNEL の initramfs がない" "/boot/initrd.img-$NEXT_KERNEL がない。このままでは起動できない可能性が高い。
+→ sudo update-initramfs -c -k $NEXT_KERNEL" ;;
+    esac
+  fi
+
+  if (( ${#others[@]} )); then
+    body=""
+    for k in "${others[@]}"; do body+="$k: $(initrd_desc "$k")"$'\n'; done
+    finding INFO "initramfs に NVIDIA ドライバが入っている他のカーネルが ${#others[@]} 個" "${body}GRUB の詳細メニューでこれらを選ぶと、起動の初期に nvidia-drm が読み込まれる。ルートが暗号化されていると、パスフレーズの入力画面が出ずに止まることがある。普段使わないなら問題ない。"
+  fi
   return 0
 }
 
@@ -1504,6 +1718,8 @@ main() {
   F_LEVEL=() F_TITLE=() F_BODY=()
   check_core
   check_kernels
+  check_initramfs
+  check_module_source
   check_dkms
   check_secureboot
   check_kernel_log

@@ -17,7 +17,7 @@ description: "Ubuntu の NVIDIA ドライバ/カーネル診断スクリプト d
 
 - 前半: 自動判定。概要 (カーネル、GPU、ドライバの各バージョン、Secure Boot、セッション) と `[FAIL]` `[WARN]` `[INFO]` `[ OK ]` の所見。
 - 後半: `######## 見出し ########` ごとの生データ。`$ コマンド` の行に続いて出力がある。`[exit N]` は終了コード (grep の 1 は「一致なし」)。
-  主な見出し: システム、診断ツールの有無、GPU (lspci)、カーネルモジュール、ブート設定とカーネルパッケージ、インストール済みカーネルと nvidia モジュール、DKMS、Secure Boot、モジュールの読み込みを妨げる設定、カーネルログ (今回/前回の起動)、システムジャーナル、GSP ファームウェア、ユーザー空間ライブラリ、nvidia-smi、OpenGL / Vulkan の実地確認、Xorg ログ、NVIDIA 関連パッケージ、自動削除のシミュレーション、権限が必要な追加確認、再起動待ちと最近の更新、systemd、Chrome / Chromium、添付: <ファイル> (chrome://gpu のコピーなど)。
+  主な見出し: システム、診断ツールの有無、GPU (lspci)、カーネルモジュール、ブート設定とカーネルパッケージ、インストール済みカーネルと nvidia モジュール、initramfs と NVIDIA、DKMS、Secure Boot、モジュールの読み込みを妨げる設定、カーネルログ (今回/前回の起動)、システムジャーナル、GSP ファームウェア、ユーザー空間ライブラリ、nvidia-smi、OpenGL / Vulkan の実地確認、Xorg ログ、NVIDIA 関連パッケージ、自動削除のシミュレーション、権限が必要な追加確認、再起動待ちと最近の更新、systemd、Chrome / Chromium、添付: <ファイル> (chrome://gpu のコピーなど)。
 - 既定で、通常権限の情報収集・描画テスト・自動削除シミュレーションを先に行い、最後に説明後の sudo 認証を確認し、権限が必要な読み取りだけに使用する。パスワード入力前に sudo の読み取りコマンド一覧を条件付きの候補も含めて表示し、認証確認と個々のコマンドは実行直前にも表示する。レポートの「実行候補」は予定であり、すべて実行済みという意味ではない。「権限が必要な追加確認」節以降で GRUB・MOK・ログを追加取得し、最終所見に反映する。生データの先頭は認証前の情報なので、sudo の使用状況は追加確認節も参照する。`--no-sudo` 指定、sudo 不在、認証不可の場合は一般ユーザーで読める範囲だけ収集する。非対話実行ではパスワードを求めない。認証できても途中で権限を利用できなくなる場合があるので、各節の実出力を確認する。
 - `--redact` 付きならホスト名は `<host>`、ユーザー名は `<user>`。
 
@@ -70,6 +70,16 @@ NVIDIA のカーネルモジュールと、それに対応するユーザー空�
 - 次回起動カーネルは推定。`GRUB_DEFAULT=0` では生成済み grub.cfg の先頭の起動エントリを確認する。版番号順だけでは OEM / generic などの選択を確定できない。`saved` や `grubenv` の `saved_entry` / `next_entry` があればそれに従う。保存エントリ ID は生成済み grub.cfg の menuentry と照合し、linux 行のカーネルを推定する。Advanced options から選んで保存された階層指定 (`gnulinux-advanced-…>gnulinux-<k>-advanced-…`) は末尾の ID で照合する。番号やタイトルによる指定、動的なパス、複数候補、読み取り不可では不明になる。不明をモジュール欠落と同一視しない。
 - 新しいカーネル (HWE や OEM の更新) で DKMS のビルドが失敗するのは典型的な更新起因の障害。`/var/log/apt/term.log` の `Bad return status for module build on kernel: <k>` と make.log の `error:` 行が証拠。失敗だけでカーネル未対応と断定せず、ヘッダ不足、コンパイラ、署名やディスク容量などの具体的なエラーを確認する。未対応なら、動くカーネルで起動して対応版を待つ。
 - 実行中カーネルのヘッダ (`linux-headers-<k>`) がなければ DKMS はビルドできない。
+- 「次回起動予定 (推定) のカーネル <k> は、まだ一度も起動に成功していない」は、ジャーナルの `Linux version` の記録にそのカーネルがない場合の INFO。ルートの解錠前に止まった起動はジャーナルに残らないので、「起動を試して失敗した」かどうかは分からない。`saved_entry` がメニュー最上段 (`gnulinux-simple-…`) や `GRUB_DEFAULT=0` のときは、update-grub のたびに起動先が最新のカーネルに変わる。カーネルの導入から日がたって、別の更新の update-grub で切り替わることもある。
+- 生データの「カーネルごとに読み込まれる nvidia.ko」と「供給元」(DKMS / ビルド済み) で、カーネルごとに別のビルドが使われていないかを見る。「次回起動予定 (推定) のカーネル <k> の nvidia モジュールの供給元 (…) が実行中 (…) と違う」は WARN。DKMS は、同じ版のビルド済みモジュールが先にあると組み込みを見送る (term.log に `DKMS will not replace this module`)。そのため、パッケージが入った順番でカーネルごとに供給元が分かれることがある。ユーザーが意図して片方を使っている場合もある (以前、もう片方で不調が出たなど) ので、どちらにそろえるかは決めつけず、今動いているほうを基準に提案する。
+
+### initramfs
+
+- 「initramfs と NVIDIA」節に、カーネルごとの initramfs のサイズ、中の NVIDIA GPU ドライバ (`nvidia`、`nvidia-drm`、`nvidia-modeset`、`nvidia-uvm`、`nvidia-peermem`)、GSP ファームウェアの数、暗号化ルート (cryptroot) の有無、`framebuffer-nvidia` フックと dpkg-divert の状態、`updates/dkms` のファイル名がある。`hid-nvidia-shield`、`forcedeth`、`typec_nvidia` などは名前に nvidia を含むだけで GPU ドライバではない。
+- initramfs に GPU ドライバが入ると、ルートファイルシステムより前、起動のごく初期に nvidia-drm が読み込まれる。ルートが LUKS で暗号化されていると、パスフレーズの入力画面が出ないまま黒い画面で止まった事例がある (2026 年 11 月、7.0 系の generic カーネル)。このとき、ジャーナルには何も残らない。
+- 「次回起動予定 (推定) のカーネル <k> の initramfs に NVIDIA ドライバが入っている (実行中のカーネルにはない)」は WARN で、再起動を勧めない (`NEXT_BAD`)。実行中のカーネルも同じ構成で起動できているなら INFO にとどめる。
+- `nvidia-kernel-common-NNN` の `/usr/share/initramfs-tools/hooks/framebuffer-nvidia` は、`updates/dkms` の `nvidia*.ko` を拾う (595 系の版で確認)。非圧縮の `.ko` だけが一致し、`.ko.zst` は一致しない。そのため、同じ DKMS でも、カーネルによって入ったり入らなかったりする。ビルド済みモジュール (`kernel/nvidia-NNN*/`) は対象外。
+- 対処はフックを hooks ディレクトリの外へ退避して (`dpkg-divert --local --rename --divert /usr/share/initramfs-tools/framebuffer-nvidia.disabled --add …`)、`update-initramfs -u -k <k>`。hooks ディレクトリ内での改名 (`.distrib` など) では、そのファイルも実行されてしまう。DKMS を外す方法でも入らなくなるが、読み込まれるモジュールの供給元が変わる。
 
 ### Secure Boot
 
@@ -77,6 +87,7 @@ NVIDIA のカーネルモジュールと、それに対応するユーザー空�
 - 登録は `sudo mokutil --import <MOK.der>` → 再起動 → 青い MOK Manager 画面で Enroll MOK。画面は数秒で閉じ、閉じると登録されない。
 - `MOK_STATE` が `unreadable` なのは一般ユーザーで実行したため。判定に影響しないことが多いが、Secure Boot が疑わしいときは、sudo 認証が利用できるデスクトップのターミナルで `--no-sudo` を外して再実行を頼む。既定の sudo 認証が失敗していないかも確認する。
 - Secure Boot を無効にする案は最後の手段としてのみ挙げる。
+- Secure Boot が無効なら、カーネルはモジュールの署名を検証しない。DKMS のモジュールが読み込めていても、それは MOK に鍵が登録されている根拠にならない。後で Secure Boot を有効にすると、未登録の鍵で署名した DKMS のモジュールは読み込めなくなる。
 
 ### カーネルログ
 
